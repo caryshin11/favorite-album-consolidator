@@ -338,6 +338,25 @@ namespace Favorite_Album_Consolidator
 
                 // drag/drop and selection
                 pb.MouseDown += Grid_MouseDown;
+                pb.MouseMove += (s, e) =>
+                {
+                    if (e.Button != MouseButtons.Left) return;
+                    if (_dragStartPoint == Point.Empty) return;
+
+                    int dx = Math.Abs(e.X - _dragStartPoint.X);
+                    int dy = Math.Abs(e.Y - _dragStartPoint.Y);
+
+                    if (dx >= SystemInformation.DragSize.Width / 2 ||
+                        dy >= SystemInformation.DragSize.Height / 2)
+                    {
+                        pb.DoDragDrop(pb, DragDropEffects.Move);
+                        _dragStartPoint = Point.Empty;
+                    }
+                };
+                pb.MouseUp += (s, e) =>
+                {
+                    _dragStartPoint = Point.Empty;
+                };
                 pb.DragEnter += Grid_DragEnter;
                 pb.DragDrop += Grid_DragDrop;
                 pb.Click += (s, e) => SelectBox(pb);
@@ -512,12 +531,11 @@ namespace Favorite_Album_Consolidator
         void Grid_MouseDown(object? sender, MouseEventArgs e)
         {
             if (sender is not PictureBox pb) return;
+            if (e.Button != MouseButtons.Left) return;
+            if (pb.Tag is not Album) return;
 
-            // Only start drag on RIGHT click
-            if (e.Button == MouseButtons.Right && pb.Tag is Album)
-            {
-                pb.DoDragDrop(pb, DragDropEffects.Move);
-            }
+            _dragStartPoint = e.Location;
+            _dragAlbum = null; // we drag the PictureBox itself, not Album
         }
 
         void Grid_DragEnter(object? sender, DragEventArgs e)
