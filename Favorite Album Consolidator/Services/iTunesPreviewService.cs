@@ -32,41 +32,92 @@ namespace Favorite_Album_Consolidator.Services
             if (string.IsNullOrWhiteSpace(artist) && string.IsNullOrWhiteSpace(title))
                 return new List<string>();
 
-            // Find the best matching ALBUM
-            long? collectionId = await FindBestAlbumCollectionIdAsync(artist, title);
-            if (collectionId == null)
+            using HttpClient client = new();
+            client.DefaultRequestHeaders.UserAgent.ParseAdd("FavoriteAlbumConsolidator/1.0");
+
+            string artistN = Normalize(artist);
+            string titleN = Normalize(title);
+
+            // 1) Search ALBUMS (not songs) to get the correct collectionId
+            string albumTerm = Uri.EscapeDataString($"{artist} {title}");
+            string albumSearchUrl = $"https://itunes.apple.com/search?term={albumTerm}&entity=album&limit=10&country=US";
+            string albumJson = await client.GetStringAsync(albumSearchUrl);
+
+            using JsonDocument albumDoc = JsonDocument.Parse(albumJson);
+            JsonElement albumResults = albumDoc.RootElement.GetProperty("results");
+
+            long? bestCollectionId = null;
+            int bestScore = int.MinValue;
+
+            foreach (var item in albumResults.EnumerateArray())
             {
-                // Fallback: original "song search" approach
-                return await FallbackSongSearchAsync(artist, title, limit);
-            }
+                string artistName = item.TryGetProperty("artistName", out var a) ? (a.GetString() ?? "") : "";
+                string collectionName = item.TryGetProperty("collectionName", out var c) ? (c.GetString() ?? "") : "";
 
-            // Lookup tracks for that album (collectionId)
-            string lookupUrl =
-                $"https://itunes.apple.com/lookup?id={collectionId.Value}&entity=song&limit={limit}&country=US";
+                string aN = Normalize(artistName);
+                string cN = Normalize(collectionName);
 
-            string lookupJson = await _http.GetStringAsync(lookupUrl);
+                int score = 0;
 
-            using var doc = JsonDocument.Parse(lookupJson);
-            if (!doc.RootElement.TryGetProperty("results", out var results))
-                return new List<string>();
-
-            // First item is the collection info; songs follow
-            var urls = new List<string>();
-            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-            foreach (var item in results.EnumerateArray())
-            {
-                // Only track items have previewUrl
-                if (item.TryGetProperty("previewUrl", out var p))
+                // Strongly prefer exact album title matches
+                if (!string.IsNullOrWhiteSpace(titleN))
                 {
-                    var u = p.GetString();
-                    if (!string.IsNullOrWhiteSpace(u) && seen.Add(u))
-                        urls.Add(u);
+                    if (cN == titleN) score += 20;
+                    else if (cN.StartsWith(titleN)) score += 12; 
+                    else if (cN.Contains(titleN)) score += 6;
+                    else score -= 10;
+                }
+
+                // Strongly prefer exact artist matches
+                if (!string.IsNullOrWhiteSpace(artistN))
+                {
+                    if (aN == artistN) score += 15;
+                    else if (aN.Contains(artistN) || artistN.Contains(aN)) score += 6;
+                    else score -= 10;
+                }
+
+                // Penalize common “wrong-ish” variants unless user typed them
+                if (!titleN.Contains("deluxe") && cN.Contains("deluxe")) score -= 4;
+                if (!titleN.Contains("remaster") && (cN.Contains("remaster") || cN.Contains("remastered"))) score -= 4;
+                if (!titleN.Contains("edition") && cN.Contains("edition")) score -= 2;
+
+                if (item.TryGetProperty("collectionId", out var idProp) && idProp.TryGetInt64(out var id))
+                {
+                    if (score > bestScore)
+                    {
+                        bestScore = score;
+                        bestCollectionId = id;
+                    }
                 }
             }
 
-            return urls;
+            if (bestCollectionId == null)
+                return new List<string>(); // no good album match found
+
+            // 2) Lookup tracks for that album collectionId (this is the key)
+            string lookupUrl = $"https://itunes.apple.com/lookup?id={bestCollectionId.Value}&entity=song&limit={limit}&country=US";
+            string lookupJson = await client.GetStringAsync(lookupUrl);
+
+            using JsonDocument lookupDoc = JsonDocument.Parse(lookupJson);
+            JsonElement lookupResults = lookupDoc.RootElement.GetProperty("results");
+
+            // Collect previewUrls from tracks (skip duplicates)
+            List<string> deduped = new();
+            HashSet<string> seen = new();
+
+            foreach (var item in lookupResults.EnumerateArray())
+            {
+                if (item.TryGetProperty("previewUrl", out var p))
+                {
+                    string u = p.GetString() ?? "";
+                    if (!string.IsNullOrWhiteSpace(u) && seen.Add(u))
+                        deduped.Add(u);
+                }
+            }
+
+            return deduped;
         }
+
 
         private async Task<long?> FindBestAlbumCollectionIdAsync(string artist, string title)
         {

@@ -28,11 +28,16 @@ namespace Favorite_Album_Consolidator
         private readonly Color TileNormalBorder = Color.Transparent;
         private readonly Color TileHoverBorder = Color.FromArgb(255, 170, 120, 255); // color of glow
 
+        // Error handling when mouse flickers too fast
+        private readonly List<GlowPanel> _gridCells = new();
+        private readonly System.Windows.Forms.Timer _hoverFixTimer = new();
+
         // Audio preview
         private readonly WindowsMediaPlayer _player = new WindowsMediaPlayer();
         private readonly ItunesPreviewService _previewService = new ItunesPreviewService();
-        private string? _currentPreviewUrl;
-
+        private readonly Random _rng = new Random();
+        private readonly AlbumPreviewOverlayPlayer _overlayPlayer =
+    new AlbumPreviewOverlayPlayer(new ItunesPreviewService(), volume: 80);
 
         // Hosting the grid size + splitting the results panel and grid
         Panel gridHost = new();
@@ -70,6 +75,11 @@ namespace Favorite_Album_Consolidator
             };
 
             CreateGrid();
+
+            // Fix stuck hover when mouse moves very fast (MouseLeave can be missed)
+            _hoverFixTimer.Interval = 30;
+            _hoverFixTimer.Tick += (s, e) => FixGridHover();
+            _hoverFixTimer.Start();
 
             // Resize square grid after creating
             this.Shown += (s, e) => split.SplitterDistance = 300;
@@ -314,6 +324,8 @@ namespace Favorite_Album_Consolidator
                     Padding = new Padding(4)
                 };
 
+                _gridCells.Add(cell);
+
                 MarqueeLabel lbl = new()
                 {
                     Dock = DockStyle.Bottom,
@@ -337,13 +349,6 @@ namespace Favorite_Album_Consolidator
                     cell.BorderColor = on ? TileHoverBorder : TileNormalBorder;
                     cell.Invalidate();
                 }
-
-                cell.MouseEnter += (s, e) => SetHover(true);
-                cell.MouseLeave += (s, e) => SetHover(false);
-                pb.MouseEnter += (s, e) => SetHover(true);
-                pb.MouseLeave += (s, e) => SetHover(false);
-                lbl.MouseEnter += (s, e) => SetHover(true);
-                lbl.MouseLeave += (s, e) => SetHover(false);
 
                 // drag/drop and selection
                 pb.MouseDown += Grid_MouseDown;
@@ -378,6 +383,7 @@ namespace Favorite_Album_Consolidator
                 cell.Controls.Add(pb);
                 cell.Controls.Add(lbl);
                 tblGrid.Controls.Add(cell);
+                _overlayPlayer.AttachOverlay(cell, pb, SetHover);
             }
         }
 
@@ -593,37 +599,78 @@ namespace Favorite_Album_Consolidator
 
             try
             {
-                // Get a preview URL (track preview) from iTunes
-                var urls = await _previewService.GetAlbumPreviewUrlsAsync(album, limit: 1);
-                var url = urls.FirstOrDefault();
-
-                if (string.IsNullOrWhiteSpace(url))
+                // Grab multiple previews so we can randomize
+                var urls = await _previewService.GetAlbumPreviewUrlsAsync(album, limit: 25);
+                if (urls.Count == 0)
                 {
-                    MessageBox.Show("No iTunes preview found for this album.", "Preview",
-                        MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    MessageBox.Show("No iTunes previews found for this album.");
                     return;
                 }
 
-                // If it's the same preview and currently playing, toggle stop
-                if (_currentPreviewUrl == url && _player.playState == WMPPlayState.wmppsPlaying)
-                {
-                    _player.controls.stop();
-                    return;
-                }
+                // Pick a RANDOM preview every time
+                string url = urls[_rng.Next(urls.Count)];
 
-                // Start new preview
+                // Stop whatever is playing
                 _player.controls.stop();
-                _player.URL = url;          // setting URL is enough for WMP
-                _player.controls.play();
 
-                _currentPreviewUrl = url;
+                // Play new random track
+                _player.URL = url;
+                _player.controls.play();
             }
             catch (Exception ex)
             {
-                MessageBox.Show("Preview failed: " + ex.Message, "Error",
-                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+                MessageBox.Show("Preview failed:\n" + ex.Message);
             }
         }
+
+        private void FixGridHover()
+        {
+            // If grid isn't visible yet, bail
+            if (!tblGrid.IsHandleCreated || !tblGrid.Visible) return;
+
+            // Mouse position in tblGrid coordinates
+            Point p = tblGrid.PointToClient(Control.MousePosition);
+
+            // If not inside the grid bounds, clear all
+            if (!tblGrid.ClientRectangle.Contains(p))
+            {
+                foreach (var cell in _gridCells)
+                {
+                    cell.BorderColor = TileNormalBorder;
+                    cell.Invalidate();
+                }
+                return;
+            }
+
+            // Find which GlowPanel cell is under the mouse
+            Control? hit = tblGrid.GetChildAtPoint(p);
+            GlowPanel? hoveredCell = null;
+
+            // GetChildAtPoint sometimes returns inner controls; walk up to GlowPanel
+            while (hit != null)
+            {
+                if (hit is GlowPanel gp)
+                {
+                    hoveredCell = gp;
+                    break;
+                }
+                hit = hit.Parent;
+                if (hit == tblGrid) break;
+            }
+
+            // Apply glow only to the hovered cell
+            foreach (var cell in _gridCells)
+            {
+                bool on = (cell == hoveredCell);
+                var desired = on ? TileHoverBorder : TileNormalBorder;
+                if (cell.BorderColor != desired)
+                {
+                    cell.BorderColor = desired;
+                    cell.Invalidate();
+                }
+            }
+        }
+
 
         void SwapBoxes(PictureBox a, PictureBox b)
         {
@@ -803,7 +850,11 @@ namespace Favorite_Album_Consolidator
                 LayoutSquareGrid();
             }
         }
-
+        protected override void OnFormClosed(FormClosedEventArgs e)
+        {
+            _overlayPlayer.Dispose();
+            base.OnFormClosed(e);
+        }
         protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
         {
             if (keyData == Keys.Delete && selectedBox != null)

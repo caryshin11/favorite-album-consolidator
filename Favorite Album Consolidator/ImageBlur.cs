@@ -10,7 +10,6 @@ namespace Favorite_Album_Consolidator
     {
         public static Bitmap QuickBlur(Bitmap src, int factor = 10)
         {
-            // factor 8–14 is a nice blur. Higher = blurrier.
             int w = Math.Max(1, src.Width / factor);
             int h = Math.Max(1, src.Height / factor);
 
