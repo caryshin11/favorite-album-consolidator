@@ -13,7 +13,10 @@ namespace Favorite_Album_Consolidator
 {
     /// <summary>
     /// iTunes preview playback + caching + hover-only inset controls with fade.
-    /// Fix: only the active tile shows Pause while playing; other tiles show Play.
+    /// - Only active tile shows Pause while playing.
+    /// - Label shows "Artist - Song" while previewing.
+    /// - Label restores to "AlbumArtist - AlbumTitle" when playback stops/ends or when switching active tile.
+    /// - Skip is random; Previous restarts current if > threshold else plays previous previewed track.
     /// </summary>
     public sealed class AlbumPreviewOverlayPlayer : IDisposable
     {
@@ -22,20 +25,35 @@ namespace Favorite_Album_Consolidator
         private readonly Random _rng = new Random();
         private readonly ToolTip _toolTip = new ToolTip();
 
-        private readonly Dictionary<string, List<string>> _albumPreviewCache = new();
+        private readonly Dictionary<string, List<PreviewTrack>> _albumPreviewCache = new();
 
-        // History for Previous behavior
-        private readonly Stack<string> _history = new();
         private const double RestartThresholdSeconds = 2.0;
 
-        private string? _currentPreviewUrl;
         private string? _currentAlbumKey;
+        private PreviewTrack? _currentTrack;
+        private const string NowPlayingPrefix = "NOW PLAYING · ";
 
-        // Active tile + play state 
+        // Active tile tracking
         private bool _isPlaying = false;
         private PictureBox? _activeCoverPb;
 
-        // Keep references so redraw play icons for ALL tiles properly
+        // Labels per tile so we can update/restore correctly
+        private readonly Dictionary<PictureBox, MarqueeLabel> _tileLabelMap = new();
+
+        // Remember last active tile label so we can restore on stop
+        private MarqueeLabel? _activeTileLabel;
+
+        // History includes which tile it came from (so "previous" can jump back across tiles)
+        private sealed class HistoryEntry
+        {
+            public required PreviewTrack Track { get; init; }
+            public required string AlbumKey { get; init; }
+            public required PictureBox TilePb { get; init; }
+        }
+
+        private readonly Stack<HistoryEntry> _history = new();
+
+        // Keep references so we can redraw play icons for ALL tiles properly
         private readonly List<PlayBtnReg> _playButtons = new();
 
         private sealed class PlayBtnReg
@@ -60,13 +78,31 @@ namespace Favorite_Album_Consolidator
             _player.settings.mute = false;
             Volume = volume;
 
-            // Update play-state and refresh ALL tiles when playback changes
             _player.PlayStateChange += (newState) =>
             {
                 var state = (WMPPlayState)newState;
                 _isPlaying = state == WMPPlayState.wmppsPlaying;
 
-                UpdateAllPlayIconsSafe();
+                RunOnUiThread(() =>
+                {
+                    // When playback stops/ends: restore album caption
+                    if (state == WMPPlayState.wmppsStopped || state == WMPPlayState.wmppsMediaEnded)
+                    {
+                        RestoreActiveTileLabelToAlbum();
+                    }
+
+                    // When playback starts again (after stop/pause): re-show song caption
+                    if (state == WMPPlayState.wmppsPlaying && _currentTrack != null)
+                    {
+                        // Make sure we still have the correct active label pointer
+                        if (_activeCoverPb != null && _tileLabelMap.TryGetValue(_activeCoverPb, out var lbl))
+                            _activeTileLabel = lbl;
+
+                        UpdateActiveTileLabelToSong(_currentTrack);
+                    }
+
+                    UpdateAllPlayIconsSafe();
+                });
             };
         }
 
@@ -77,15 +113,16 @@ namespace Favorite_Album_Consolidator
 
         // ---------- Public API ----------
 
-        /// <summary>
-        /// Adds an inset top-row control bar that appears only on hover and fades in/out.
-        /// Also forwards hover to setHover so GlowPanel stays lit while on the buttons.
-        /// </summary>
         public void AttachOverlay(Control cellContainer, PictureBox coverPictureBox, Action<bool> setHover)
         {
             if (cellContainer == null) throw new ArgumentNullException(nameof(cellContainer));
             if (coverPictureBox == null) throw new ArgumentNullException(nameof(coverPictureBox));
             if (setHover == null) throw new ArgumentNullException(nameof(setHover));
+
+            // Grab the tile label once and register it
+            var tileLabel = cellContainer.Controls.OfType<MarqueeLabel>().FirstOrDefault();
+            if (tileLabel != null)
+                _tileLabelMap[coverPictureBox] = tileLabel;
 
             // --- Bar ---
             var bar = new TableLayoutPanel
@@ -104,10 +141,8 @@ namespace Favorite_Album_Consolidator
             bar.RowStyles.Clear();
             bar.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
 
-            // Buttons
             var btnPrev = MakeOverlayButton("Previous", (s, e) =>
             {
-                // Previous: restart if > threshold else go back in history
                 Previous();
                 UpdateAllPlayIconsSafe();
             });
@@ -116,12 +151,10 @@ namespace Favorite_Album_Consolidator
             {
                 if (coverPictureBox.Tag is not Album a) return;
 
-                // Mark THIS tile active
-                _activeCoverPb = coverPictureBox;
+                SetActiveTile(coverPictureBox);
 
-                // If nothing loaded or different album, start random; else toggle
-                if (string.IsNullOrWhiteSpace(_currentPreviewUrl) || _currentAlbumKey != AlbumKey(a))
-                    await PlayRandomAsync(a);
+                if (_currentTrack == null || _currentAlbumKey != AlbumKey(a))
+                    await PlayRandomAsync(a, coverPictureBox);
                 else
                     TogglePlayPause();
 
@@ -132,10 +165,9 @@ namespace Favorite_Album_Consolidator
             {
                 if (coverPictureBox.Tag is not Album a) return;
 
-                // Mark THIS tile active
-                _activeCoverPb = coverPictureBox;
+                SetActiveTile(coverPictureBox);
 
-                await PlayRandomAsync(a);
+                await PlayRandomAsync(a, coverPictureBox);
 
                 UpdateAllPlayIconsSafe();
             });
@@ -148,11 +180,11 @@ namespace Favorite_Album_Consolidator
             bar.BringToFront();
 
             // --- Fade + sizing ---
-            const int inset = 8;             // keeps glow border visible
-            const int maxBgAlpha = 90;       // max button background alpha
-            const int maxIconAlpha = 255;    // max icon alpha
-            const int tickMs = 15;           // animation tick
-            const int step = 18;             // alpha step per tick
+            const int inset = 8;
+            const int maxBgAlpha = 90;
+            const int maxIconAlpha = 255;
+            const int tickMs = 15;
+            const int step = 18;
 
             int labelHeight = GuessBottomLabelHeight(cellContainer);
 
@@ -161,7 +193,6 @@ namespace Favorite_Album_Consolidator
             int targetBgAlpha = 0;
             int targetIconAlpha = 0;
 
-            // current icon sizing values (per tile) for global icon refresh
             int currentIconSize = 18;
             int currentIconAlpha = 0;
 
@@ -192,7 +223,6 @@ namespace Favorite_Album_Consolidator
 
                 int iconSize = Math.Max(12, barH - 12);
 
-                // Save per-tile values so UpdateAllPlayIconsSafe can redraw correctly
                 currentIconSize = iconSize;
                 currentIconAlpha = iconAlpha;
 
@@ -246,19 +276,17 @@ namespace Favorite_Album_Consolidator
                 if (!fadeTimer.Enabled) fadeTimer.Start();
             }
 
-            // --- Robust hover detection (prevents lingering when MouseLeave is missed) 
+            // Robust hover polling (prevents lingering when MouseLeave is missed)
             bool lastInside = false;
 
             bool IsCursorInCell()
             {
-                // If handle isn't created or we're disposed, treat as not-hovering
                 if (!cellContainer.IsHandleCreated) return false;
-
                 Point p = cellContainer.PointToClient(Control.MousePosition);
                 return cellContainer.ClientRectangle.Contains(p);
             }
 
-            var hoverPoll = new System.Windows.Forms.Timer { Interval = 40 }; // ~25fps
+            var hoverPoll = new System.Windows.Forms.Timer { Interval = 40 };
             hoverPoll.Tick += (s, e) =>
             {
                 if (cellContainer.IsDisposed)
@@ -286,16 +314,10 @@ namespace Favorite_Album_Consolidator
             };
             hoverPoll.Start();
 
-            // Clean up timer when the cell goes away
             cellContainer.Disposed += (s, e) =>
             {
                 try { hoverPoll.Stop(); } catch { }
                 try { hoverPoll.Dispose(); } catch { }
-            };
-
-            // Also stop the fade timer when cell is disposed 
-            cellContainer.Disposed += (s, e) =>
-            {
                 try { fadeTimer.Stop(); } catch { }
                 try { fadeTimer.Dispose(); } catch { }
             };
@@ -313,122 +335,126 @@ namespace Favorite_Album_Consolidator
                 GetIconAlpha = () => currentIconAlpha
             });
 
-            // Double-click cover = random track (and mark this tile active)
+            // Double-click cover = random track
             coverPictureBox.DoubleClick += async (s, e) =>
             {
                 if (coverPictureBox.Tag is not Album a) return;
 
-                _activeCoverPb = coverPictureBox;
+                SetActiveTile(coverPictureBox);
 
-                await PlayRandomAsync(a);
+                await PlayRandomAsync(a, coverPictureBox);
 
                 UpdateAllPlayIconsSafe();
             };
         }
 
-        private void UpdateAllPlayIconsSafe()
+        // ---------- Active tile + label management ----------
+
+        private void SetActiveTile(PictureBox newPb)
         {
-            // Remove disposed entries occasionally
-            _playButtons.RemoveAll(x => x.PlayBtn.IsDisposed || x.CoverPb.IsDisposed);
+            // If switching tiles, restore the previous active tile label back to album caption
+            if (_activeCoverPb != null && !ReferenceEquals(_activeCoverPb, newPb))
+                RestoreTileLabelToAlbum(_activeCoverPb);
 
-            if (_playButtons.Count == 0) return;
+            _activeCoverPb = newPb;
 
-            // Marshal to UI thread using any live button
-            var anyBtn = _playButtons[0].PlayBtn;
-            if (anyBtn.IsDisposed) return;
-
-            void Update()
-            {
-                foreach (var reg in _playButtons.ToList())
-                {
-                    if (reg.PlayBtn.IsDisposed) continue;
-
-                    int size = reg.GetIconSize();
-                    int alpha = reg.GetIconAlpha();
-
-                    bool isActive = ReferenceEquals(reg.CoverPb, _activeCoverPb);
-                    bool showPause = _isPlaying && isActive;
-
-                    reg.PlayBtn.Image = MakeIcon(showPause ? MiniIcon.Pause : MiniIcon.Play, size, alpha);
-                }
-            }
-
-            if (anyBtn.InvokeRequired) anyBtn.BeginInvoke((Action)Update);
-            else Update();
+            // Cache active label pointer (if exists)
+            _activeTileLabel = _tileLabelMap.TryGetValue(newPb, out var lbl) ? lbl : null;
         }
 
-        private static int MoveToward(int current, int target, int delta)
+        private void UpdateActiveTileLabelToSong(PreviewTrack track)
         {
-            if (current < target) return Math.Min(target, current + delta);
-            if (current > target) return Math.Max(target, current - delta);
-            return current;
+            if (_activeTileLabel == null || _activeTileLabel.IsDisposed) return;
+
+            _activeTileLabel.Text =
+                $"{NowPlayingPrefix}{track.ArtistName} - {track.TrackName}";
         }
 
-        private static int GuessBottomLabelHeight(Control cellContainer)
+        private void RestoreActiveTileLabelToAlbum()
         {
-            var bottom = cellContainer.Controls
-                .OfType<Control>()
-                .FirstOrDefault(c => c.Dock == DockStyle.Bottom);
-
-            return bottom?.Height > 0 ? bottom.Height : 30;
+            if (_activeCoverPb == null) return;
+            RestoreTileLabelToAlbum(_activeCoverPb);
         }
+
+        private void RestoreTileLabelToAlbum(PictureBox pb)
+        {
+            if (!_tileLabelMap.TryGetValue(pb, out var lbl)) return;
+            if (lbl.IsDisposed) return;
+
+            if (pb.Tag is Album a)
+                lbl.Text = $"{a.Artist} - {a.Title}";
+            else
+                lbl.Text = "";
+        }
+
 
         // ---------- Playback ----------
 
         private static string AlbumKey(Album a)
             => $"{(a.Artist ?? "").Trim().ToLowerInvariant()}|{(a.Title ?? "").Trim().ToLowerInvariant()}";
 
-        private async Task<List<string>> GetCachedPreviewsAsync(Album album)
+        private async Task<List<PreviewTrack>> GetCachedPreviewsAsync(Album album)
         {
             string key = AlbumKey(album);
 
             if (_albumPreviewCache.TryGetValue(key, out var cached) && cached.Count > 0)
                 return cached;
 
-            var urls = await _previewService.GetAlbumPreviewUrlsAsync(album, limit: 25);
-            _albumPreviewCache[key] = urls;
-            return urls;
+            var tracks = await _previewService.GetAlbumPreviewsAsync(album, limit: 25);
+            _albumPreviewCache[key] = tracks;
+            return tracks;
         }
 
-        private async Task PlayRandomAsync(Album album)
+        private async Task PlayRandomAsync(Album album, PictureBox tilePb)
         {
-            var urls = await GetCachedPreviewsAsync(album);
-            if (urls.Count == 0)
+            var tracks = await GetCachedPreviewsAsync(album);
+            if (tracks.Count == 0)
             {
                 MessageBox.Show("No iTunes previews found for this album.", "Preview",
                     MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
 
-            // choose random (try to avoid immediate repeat)
-            string chosen = urls[_rng.Next(urls.Count)];
-            if (urls.Count > 1 && chosen == _currentPreviewUrl)
+            var chosen = tracks[_rng.Next(tracks.Count)];
+
+            // Avoid immediate repeat if possible
+            if (_currentTrack != null && tracks.Count > 1 && chosen.PreviewUrl == _currentTrack.PreviewUrl)
             {
                 for (int i = 0; i < 4; i++)
                 {
-                    var candidate = urls[_rng.Next(urls.Count)];
-                    if (candidate != _currentPreviewUrl) { chosen = candidate; break; }
+                    var cand = tracks[_rng.Next(tracks.Count)];
+                    if (cand.PreviewUrl != _currentTrack.PreviewUrl) { chosen = cand; break; }
                 }
             }
 
-            PlayUrl(chosen, AlbumKey(album));
+            PlayTrack(chosen, AlbumKey(album), tilePb);
         }
 
-        private void PlayUrl(string url, string albumKey)
+        private void PlayTrack(PreviewTrack track, string albumKey, PictureBox tilePb)
         {
-            // push current into history (only if different)
-            if (!string.IsNullOrWhiteSpace(_currentPreviewUrl) &&
-                !string.Equals(_currentPreviewUrl, url, StringComparison.OrdinalIgnoreCase))
+            // push current into history (if different)
+            if (_currentTrack != null && !string.Equals(_currentTrack.PreviewUrl, track.PreviewUrl, StringComparison.OrdinalIgnoreCase)
+                && _activeCoverPb != null && _currentAlbumKey != null)
             {
-                _history.Push(_currentPreviewUrl);
+                _history.Push(new HistoryEntry
+                {
+                    Track = _currentTrack,
+                    AlbumKey = _currentAlbumKey,
+                    TilePb = _activeCoverPb
+                });
             }
 
-            _currentPreviewUrl = url;
+            _currentTrack = track;
             _currentAlbumKey = albumKey;
 
+            // Ensure tile is active for label + icon updates
+            SetActiveTile(tilePb);
+
             _player.controls.stop();
-            _player.URL = url;
+            _player.URL = track.PreviewUrl;
             _player.controls.play();
+
+            UpdateActiveTileLabelToSong(track);
         }
 
         private void TogglePlayPause()
@@ -441,10 +467,10 @@ namespace Favorite_Album_Consolidator
 
         private void Previous()
         {
-            // If currently playing and position past threshold, restart current preview
+            // Restart current preview if played enough
             try
             {
-                if (!string.IsNullOrWhiteSpace(_currentPreviewUrl))
+                if (_currentTrack != null)
                 {
                     double pos = _player.controls.currentPosition;
                     if (pos >= RestartThresholdSeconds)
@@ -454,24 +480,28 @@ namespace Favorite_Album_Consolidator
                     }
                 }
             }
-            catch
-            {
-                // ignore position errors
-            }
+            catch { /* ignore */ }
 
-            // otherwise go to previous preview in history
+            // Otherwise go back in history (could be a different tile/album)
             if (_history.Count == 0) return;
 
-            var url = _history.Pop();
-            if (string.IsNullOrWhiteSpace(url)) return;
+            var entry = _history.Pop();
+            if (entry.Track == null || string.IsNullOrWhiteSpace(entry.Track.PreviewUrl)) return;
+
+            // Activate that tile and play that track
+            SetActiveTile(entry.TilePb);
+
+            _currentTrack = entry.Track;
+            _currentAlbumKey = entry.AlbumKey;
 
             _player.controls.stop();
-            _player.URL = url;
+            _player.URL = entry.Track.PreviewUrl;
             _player.controls.play();
-            _currentPreviewUrl = url;
+
+            UpdateActiveTileLabelToSong(entry.Track);
         }
 
-        // ---------- UI: buttons + icons ----------
+        // ---------- Icons + UI helpers ----------
 
         private enum MiniIcon { Prev, Play, Pause, Next }
 
@@ -481,7 +511,7 @@ namespace Favorite_Album_Consolidator
             {
                 Dock = DockStyle.Fill,
                 FlatStyle = FlatStyle.Flat,
-                BackColor = Color.FromArgb(0, 0, 0, 0), // starts transparent
+                BackColor = Color.FromArgb(0, 0, 0, 0),
                 ForeColor = Color.White,
                 Margin = Padding.Empty,
                 Padding = Padding.Empty,
@@ -558,6 +588,64 @@ namespace Favorite_Album_Consolidator
             }
 
             return bmp;
+        }
+
+        private static int MoveToward(int current, int target, int delta)
+        {
+            if (current < target) return Math.Min(target, current + delta);
+            if (current > target) return Math.Max(target, current - delta);
+            return current;
+        }
+
+        private static int GuessBottomLabelHeight(Control cellContainer)
+        {
+            var bottom = cellContainer.Controls
+                .OfType<Control>()
+                .FirstOrDefault(c => c.Dock == DockStyle.Bottom);
+
+            return bottom?.Height > 0 ? bottom.Height : 30;
+        }
+
+        private void UpdateAllPlayIconsSafe()
+        {
+            _playButtons.RemoveAll(x => x.PlayBtn.IsDisposed || x.CoverPb.IsDisposed);
+            if (_playButtons.Count == 0) return;
+
+            var anyBtn = _playButtons[0].PlayBtn;
+            if (anyBtn.IsDisposed) return;
+
+            void Update()
+            {
+                foreach (var reg in _playButtons.ToList())
+                {
+                    if (reg.PlayBtn.IsDisposed) continue;
+
+                    int size = reg.GetIconSize();
+                    int alpha = reg.GetIconAlpha();
+
+                    bool isActive = ReferenceEquals(reg.CoverPb, _activeCoverPb);
+                    bool showPause = _isPlaying && isActive;
+
+                    reg.PlayBtn.Image = MakeIcon(showPause ? MiniIcon.Pause : MiniIcon.Play, size, alpha);
+                }
+            }
+
+            if (anyBtn.InvokeRequired) anyBtn.BeginInvoke((Action)Update);
+            else Update();
+        }
+
+        private void RunOnUiThread(Action action)
+        {
+            if (_playButtons.Count > 0)
+            {
+                var anyBtn = _playButtons[0].PlayBtn;
+                if (anyBtn != null && !anyBtn.IsDisposed && anyBtn.InvokeRequired)
+                {
+                    anyBtn.BeginInvoke(action);
+                    return;
+                }
+            }
+            action();
         }
     }
 }

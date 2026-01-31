@@ -374,7 +374,6 @@ namespace Favorite_Album_Consolidator
                 pb.DragEnter += Grid_DragEnter;
                 pb.DragDrop += Grid_DragDrop;
                 pb.Click += (s, e) => SelectBox(pb);
-                pb.DoubleClick += Grid_DoubleClick;
 
                 ContextMenuStrip menu = new();
                 menu.Items.Add("Delete", null, (s, e) => ClearBox(pb));
@@ -589,37 +588,6 @@ namespace Favorite_Album_Consolidator
                     UpdateCellCaption(source.Parent!);
                     UpdateCellCaption(target.Parent!);
                 }
-            }
-        }
-
-        private async void Grid_DoubleClick(object? sender, EventArgs e)
-        {
-            if (sender is not PictureBox pb) return;
-            if (pb.Tag is not Album album) return;
-
-            try
-            {
-                // Grab multiple previews so we can randomize
-                var urls = await _previewService.GetAlbumPreviewUrlsAsync(album, limit: 25);
-                if (urls.Count == 0)
-                {
-                    MessageBox.Show("No iTunes previews found for this album.");
-                    return;
-                }
-
-                // Pick a RANDOM preview every time
-                string url = urls[_rng.Next(urls.Count)];
-
-                // Stop whatever is playing
-                _player.controls.stop();
-
-                // Play new random track
-                _player.URL = url;
-                _player.controls.play();
-            }
-            catch (Exception ex)
-            {
-                MessageBox.Show("Preview failed:\n" + ex.Message);
             }
         }
 
