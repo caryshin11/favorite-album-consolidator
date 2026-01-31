@@ -1,4 +1,4 @@
-namespace Favorite_Album_Consolidator
+namespace SoundShelf
 {
     internal static class Program
     {

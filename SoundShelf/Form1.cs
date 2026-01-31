@@ -1,10 +1,10 @@
-using Favorite_Album_Consolidator.Models;
-using Favorite_Album_Consolidator.Services;
+using SoundShelf.Models;
+using SoundShelf.Services;
 using System.Drawing;
 using WMPLib;
 using System.Linq;
 
-namespace Favorite_Album_Consolidator
+namespace SoundShelf
 {
     public partial class Form1 : Form
     {
@@ -58,7 +58,7 @@ namespace Favorite_Album_Consolidator
         {
             InitializeComponent();
             BackColor = Color.FromArgb(31, 31, 31);
-            Text = "Favorite Album Consolidator";
+            Text = "SoundShelf";
             Width = 1200;
             Height = 800;
 

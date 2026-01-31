@@ -6,7 +6,7 @@ using System.Drawing;
 using System.Windows.Forms;
 using Timer = System.Windows.Forms.Timer;
 
-namespace Favorite_Album_Consolidator
+namespace SoundShelf
 {
     public class MarqueeLabel : Control
     {

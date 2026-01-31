@@ -1,4 +1,4 @@
-﻿namespace Favorite_Album_Consolidator
+﻿namespace SoundShelf
 {
     partial class Form1
     {

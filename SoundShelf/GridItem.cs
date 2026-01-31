@@ -2,9 +2,9 @@
 using System.Collections.Generic;
 using System.Text;
 
-using Favorite_Album_Consolidator.Models;
+using SoundShelf.Models;
 
-namespace Favorite_Album_Consolidator
+namespace SoundShelf
 {
     public class GridItem
     {

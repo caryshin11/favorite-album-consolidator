@@ -5,11 +5,11 @@ using System.Drawing.Drawing2D;
 using System.Linq;
 using System.Threading.Tasks;
 using System.Windows.Forms;
-using Favorite_Album_Consolidator.Models;
-using Favorite_Album_Consolidator.Services;
+using SoundShelf.Models;
+using SoundShelf.Services;
 using WMPLib;
 
-namespace Favorite_Album_Consolidator
+namespace SoundShelf
 {
     /// <summary>
     /// iTunes preview playback + caching + hover-only inset controls with fade.

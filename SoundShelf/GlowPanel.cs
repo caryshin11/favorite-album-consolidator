@@ -5,7 +5,7 @@ using System.Drawing;
 using System.Text;
 using System.Windows.Forms;
 
-namespace Favorite_Album_Consolidator
+namespace SoundShelf
 {
     public class GlowPanel : Panel
     {

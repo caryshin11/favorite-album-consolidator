@@ -2,9 +2,9 @@
 using System.Collections.Generic;
 using System.Text;
 using System.Text.Json;
-using Favorite_Album_Consolidator.Models;
+using SoundShelf.Models;
 
-namespace Favorite_Album_Consolidator.Services
+namespace SoundShelf.Services
 {
     public class OldMusicSearchService
     {

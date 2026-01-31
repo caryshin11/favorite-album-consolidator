@@ -5,7 +5,7 @@ using System.Drawing;
 using System.Windows.Forms;
 using System.ComponentModel;
 
-namespace Favorite_Album_Consolidator
+namespace SoundShelf
 {
     public class OverlayPanel : Panel
     {

@@ -2,7 +2,7 @@
 using System.Collections.Generic;
 using System.Text;
 
-namespace Favorite_Album_Consolidator.Models
+namespace SoundShelf.Models
 {
     public class Album
     {
