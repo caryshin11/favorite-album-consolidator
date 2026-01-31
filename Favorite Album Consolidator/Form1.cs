@@ -28,6 +28,11 @@ namespace Favorite_Album_Consolidator
         private readonly Color TileNormalBorder = Color.Transparent;
         private readonly Color TileHoverBorder = Color.FromArgb(255, 170, 120, 255); // color of glow
 
+        // Audio preview
+        private readonly WindowsMediaPlayer _player = new WindowsMediaPlayer();
+        private readonly ItunesPreviewService _previewService = new ItunesPreviewService();
+        private string? _currentPreviewUrl;
+
 
         // Hosting the grid size + splitting the results panel and grid
         Panel gridHost = new();
@@ -53,6 +58,10 @@ namespace Favorite_Album_Consolidator
             Height = 800;
 
             InitializeUI();
+
+            // Set audio volume
+            _player.settings.volume = 80;
+            _player.settings.autoStart = false;
 
             // Enable dark scroll bars after initialization
             this.Shown += (s, e) =>
@@ -360,6 +369,7 @@ namespace Favorite_Album_Consolidator
                 pb.DragEnter += Grid_DragEnter;
                 pb.DragDrop += Grid_DragDrop;
                 pb.Click += (s, e) => SelectBox(pb);
+                pb.DoubleClick += Grid_DoubleClick;
 
                 ContextMenuStrip menu = new();
                 menu.Items.Add("Delete", null, (s, e) => ClearBox(pb));
@@ -573,6 +583,45 @@ namespace Favorite_Album_Consolidator
                     UpdateCellCaption(source.Parent!);
                     UpdateCellCaption(target.Parent!);
                 }
+            }
+        }
+
+        private async void Grid_DoubleClick(object? sender, EventArgs e)
+        {
+            if (sender is not PictureBox pb) return;
+            if (pb.Tag is not Album album) return;
+
+            try
+            {
+                // Get a preview URL (track preview) from iTunes
+                var urls = await _previewService.GetAlbumPreviewUrlsAsync(album, limit: 1);
+                var url = urls.FirstOrDefault();
+
+                if (string.IsNullOrWhiteSpace(url))
+                {
+                    MessageBox.Show("No iTunes preview found for this album.", "Preview",
+                        MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return;
+                }
+
+                // If it's the same preview and currently playing, toggle stop
+                if (_currentPreviewUrl == url && _player.playState == WMPPlayState.wmppsPlaying)
+                {
+                    _player.controls.stop();
+                    return;
+                }
+
+                // Start new preview
+                _player.controls.stop();
+                _player.URL = url;          // setting URL is enough for WMP
+                _player.controls.play();
+
+                _currentPreviewUrl = url;
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("Preview failed: " + ex.Message, "Error",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
         }
 
