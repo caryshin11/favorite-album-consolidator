@@ -6,7 +6,7 @@ using Favorite_Album_Consolidator.Models;
 
 namespace Favorite_Album_Consolidator.Services
 {
-    public class MusicSearchService
+    public class OldMusicSearchService
     {
         public async Task<List<Album>> SearchAsync(string query)
         {

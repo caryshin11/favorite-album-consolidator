@@ -1,6 +1,8 @@
 using Favorite_Album_Consolidator.Models;
 using Favorite_Album_Consolidator.Services;
 using System.Drawing;
+using WMPLib;
+using System.Linq;
 
 namespace Favorite_Album_Consolidator
 {
@@ -10,6 +12,7 @@ namespace Favorite_Album_Consolidator
         Button btnSearch = new();
         Button btnSave = new();
         Button btnLoad = new();
+        Button btnExport = new();
         FlowLayoutPanel pnlResults = new();
         TableLayoutPanel tblGrid = new();
         Panel searchBoxPanel = new();
@@ -24,6 +27,7 @@ namespace Favorite_Album_Consolidator
         // For hover glow effect
         private readonly Color TileNormalBorder = Color.Transparent;
         private readonly Color TileHoverBorder = Color.FromArgb(255, 170, 120, 255); // color of glow
+
 
         // Hosting the grid size + splitting the results panel and grid
         Panel gridHost = new();
@@ -84,7 +88,7 @@ namespace Favorite_Album_Consolidator
             // Placeholder label overlays the textbox
             lblSearchPlaceholder.Dock = DockStyle.Fill;
             lblSearchPlaceholder.Text = "type to look for music";
-            lblSearchPlaceholder.Font = new Font("Segoe UI", 12F, FontStyle.Italic);
+            lblSearchPlaceholder.Font = new Font("Segoe UI", 10F, FontStyle.Italic);
             lblSearchPlaceholder.ForeColor = Color.FromArgb(150, 150, 160);
             lblSearchPlaceholder.BackColor = Color.FromArgb(22, 22, 22);
             lblSearchPlaceholder.TextAlign = ContentAlignment.MiddleLeft;
@@ -117,18 +121,22 @@ namespace Favorite_Album_Consolidator
             btnSearch.Text = "Search";
             btnSave.Text = "Save";
             btnLoad.Text = "Load";
+            btnExport.Text = "Export to PNG";
 
             btnSearch.Size = new Size(170, 55);
             btnSave.Size = new Size(170, 55);
             btnLoad.Size = new Size(170, 55);
+            btnExport.Size = new Size(270, 55);
 
             btnSearch.Font = new Font("Segoe UI", 12F);
             btnSave.Font = new Font("Segoe UI", 12F);
             btnLoad.Font = new Font("Segoe UI", 12F);
+            btnExport.Font = new Font("Segoe UI Semibold", 12F);
 
             btnSearch.Click += BtnSearch_Click;
             btnSave.Click += BtnSave_Click;
             btnLoad.Click += BtnLoad_Click;
+            btnExport.Click += BtnExport_Click;
 
             btnSearch.BackColor = Color.FromArgb(22, 22, 22);
             btnSearch.ForeColor = Color.FromArgb(236, 236, 241);
@@ -136,6 +144,8 @@ namespace Favorite_Album_Consolidator
             btnSave.ForeColor = Color.FromArgb(236, 236, 241);
             btnLoad.BackColor = Color.FromArgb(22, 22, 22);
             btnLoad.ForeColor = Color.FromArgb(236, 236, 241);
+            btnExport.BackColor = Color.FromArgb(22, 22, 22);
+            btnExport.ForeColor = Color.FromArgb(236, 236, 241);
 
             // --- Top bar (stays above everything) ---
             FlowLayoutPanel topBar = new()
@@ -145,7 +155,7 @@ namespace Favorite_Album_Consolidator
                 Padding = new Padding(8),
                 WrapContents = false
             };
-            topBar.Controls.AddRange(new Control[] { searchBoxPanel, btnSearch, btnSave, btnLoad });
+            topBar.Controls.AddRange(new Control[] { searchBoxPanel, btnSearch, btnSave, btnLoad, btnExport });
 
             // ENTER triggers search
             this.AcceptButton = btnSearch;
@@ -264,9 +274,8 @@ namespace Favorite_Album_Consolidator
             tblGrid.Dock = DockStyle.None;
             tblGrid.Anchor = AnchorStyles.None;
             tblGrid.Margin = new Padding(0);
-            tblGrid.Padding = new Padding(0);
+            tblGrid.Padding = new Padding(0, 100, 0, 0);
             tblGrid.BackColor = Color.FromArgb(31, 31, 31);
-            tblGrid.Padding = new Padding(0, 100, 0, 0);   // left, top, right, bottom
 
             tblGrid.RowCount = 5;
             tblGrid.ColumnCount = 5;
@@ -322,13 +331,12 @@ namespace Favorite_Album_Consolidator
 
                 cell.MouseEnter += (s, e) => SetHover(true);
                 cell.MouseLeave += (s, e) => SetHover(false);
-
-                // Also attach to children so moving over image/label keeps glow
                 pb.MouseEnter += (s, e) => SetHover(true);
                 pb.MouseLeave += (s, e) => SetHover(false);
                 lbl.MouseEnter += (s, e) => SetHover(true);
                 lbl.MouseLeave += (s, e) => SetHover(false);
 
+                // drag/drop and selection
                 pb.MouseDown += Grid_MouseDown;
                 pb.DragEnter += Grid_DragEnter;
                 pb.DragDrop += Grid_DragDrop;
@@ -340,7 +348,6 @@ namespace Favorite_Album_Consolidator
 
                 cell.Controls.Add(pb);
                 cell.Controls.Add(lbl);
-
                 tblGrid.Controls.Add(cell);
             }
         }
@@ -403,6 +410,20 @@ namespace Favorite_Album_Consolidator
                 foreach (Control cell in tblGrid.Controls)
                     UpdateCellCaption(cell);
             }
+        }
+
+        void BtnExport_Click(object? sender, EventArgs e)
+        {
+            using SaveFileDialog dialog = new()
+            {
+                Filter = "PNG Image (*.png)|*.png",
+                DefaultExt = "png",
+            };
+
+            if (dialog.ShowDialog() != DialogResult.OK)
+                return;
+
+            ExportGridPng(dialog.FileName);
         }
 
         PictureBox CreateResultBox(Album album)
@@ -490,8 +511,13 @@ namespace Favorite_Album_Consolidator
 
         void Grid_MouseDown(object? sender, MouseEventArgs e)
         {
-            if (sender is PictureBox pb && pb.Tag is Album)
+            if (sender is not PictureBox pb) return;
+
+            // Only start drag on RIGHT click
+            if (e.Button == MouseButtons.Right && pb.Tag is Album)
+            {
                 pb.DoDragDrop(pb, DragDropEffects.Move);
+            }
         }
 
         void Grid_DragEnter(object? sender, DragEventArgs e)
@@ -544,7 +570,6 @@ namespace Favorite_Album_Consolidator
             pb.Image = null;
             pb.ImageLocation = null;
 
-            // clear caption too
             UpdateCellCaption(pb.Parent!);
         }
 
@@ -559,6 +584,157 @@ namespace Favorite_Album_Consolidator
 
             selectedBox = pb;
             pb.BackColor = Color.LightBlue;
+        }
+
+        void ExportGridPng(string path)
+        {
+            const int TargetW = 1395;
+            const int TargetH = 1595;
+
+            // Export-only label bump (tweak if you want)
+            const float ExportLabelFontSize = 11.5f;
+            const int ExportLabelHeight = 40;
+
+            // --- Save current state ---
+            int oldW = tblGrid.Width;
+            int oldH = tblGrid.Height;
+
+            Padding oldPadding = tblGrid.Padding;
+            Padding oldMargin = tblGrid.Margin;
+            var oldDock = tblGrid.Dock;
+            var oldAnchor = tblGrid.Anchor;
+
+            // Save row/col SizeType + size
+            int colCount = tblGrid.ColumnStyles.Count;
+            int rowCount = tblGrid.RowStyles.Count;
+
+            SizeType[] oldColTypes = new SizeType[colCount];
+            float[] oldColSizes = new float[colCount];
+
+            SizeType[] oldRowTypes = new SizeType[rowCount];
+            float[] oldRowSizes = new float[rowCount];
+
+            for (int i = 0; i < colCount; i++)
+            {
+                oldColTypes[i] = tblGrid.ColumnStyles[i].SizeType;
+                oldColSizes[i] = tblGrid.ColumnStyles[i].Width;
+            }
+
+            for (int i = 0; i < rowCount; i++)
+            {
+                oldRowTypes[i] = tblGrid.RowStyles[i].SizeType;
+                oldRowSizes[i] = tblGrid.RowStyles[i].Height;
+            }
+
+            // Save label font + height so we can restore
+            List<Label> labels = new();
+            Dictionary<Label, Font> oldFonts = new();
+            Dictionary<Label, int> oldHeights = new();
+
+            foreach (Control cell in tblGrid.Controls)
+            {
+                foreach (Control c in cell.Controls)
+                {
+                    if (c is Label lbl)
+                    {
+                        labels.Add(lbl);
+                        oldFonts[lbl] = lbl.Font;
+                        oldHeights[lbl] = lbl.Height;
+                    }
+                }
+            }
+
+            try
+            {
+                // --- TEMP export layout: remove UI padding/margins so export is exact ---
+                tblGrid.Padding = Padding.Empty;
+                tblGrid.Margin = Padding.Empty;
+                tblGrid.Dock = DockStyle.None;
+                tblGrid.Anchor = AnchorStyles.None;
+
+                // --- TEMP: make labels bigger for export ---
+                foreach (var lbl in labels)
+                {
+                    lbl.Font = new Font(lbl.Font.FontFamily, ExportLabelFontSize, lbl.Font.Style);
+                    lbl.Height = ExportLabelHeight;
+                }
+
+                // --- Force exact fixed output size ---
+                tblGrid.Width = TargetW;
+                tblGrid.Height = TargetH;
+
+                // --- Force absolute sizing with NO stretching ---
+                // Column widths must sum to TargetW exactly
+                int baseCol = TargetW / 5;
+                int extraCols = TargetW % 5; // distribute remainder
+
+                // Row heights must sum to TargetH exactly
+                // Each row = cover + label
+                // cover height = rowHeight - labelHeight
+                int baseRow = TargetH / 5;
+                int extraRows = TargetH % 5;
+
+                tblGrid.ColumnStyles.Clear();
+                tblGrid.RowStyles.Clear();
+
+                for (int i = 0; i < 5; i++)
+                {
+                    int w = baseCol + (i < extraCols ? 1 : 0);
+                    tblGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, w));
+                }
+
+                for (int i = 0; i < 5; i++)
+                {
+                    int h = baseRow + (i < extraRows ? 1 : 0);
+                    tblGrid.RowStyles.Add(new RowStyle(SizeType.Absolute, h));
+                }
+
+                // IMPORTANT:
+                // Make sure your PictureBox stays square within the cell by keeping your cell layout:
+                // pb.Dock = Fill, label.Dock = Bottom with ExportLabelHeight.
+                // The cover will become (rowHeight - labelHeight) tall; if you want perfect squares,
+                // choose TargetW/5 == (TargetH/5 - ExportLabelHeight).
+
+                tblGrid.PerformLayout();
+                tblGrid.Refresh();
+
+                using Bitmap bmp = new(TargetW, TargetH);
+                tblGrid.DrawToBitmap(bmp, new Rectangle(0, 0, TargetW, TargetH));
+                bmp.Save(path, System.Drawing.Imaging.ImageFormat.Png);
+            }
+            finally
+            {
+                // --- Restore labels ---
+                foreach (var lbl in labels)
+                {
+                    lbl.Font = oldFonts[lbl];
+                    lbl.Height = oldHeights[lbl];
+                }
+
+                // --- Restore grid layout ---
+                tblGrid.Width = oldW;
+                tblGrid.Height = oldH;
+
+                tblGrid.Padding = oldPadding;
+                tblGrid.Margin = oldMargin;
+                tblGrid.Dock = oldDock;
+                tblGrid.Anchor = oldAnchor;
+
+                // Restore styles exactly
+                tblGrid.ColumnStyles.Clear();
+                tblGrid.RowStyles.Clear();
+
+                for (int i = 0; i < oldColTypes.Length; i++)
+                    tblGrid.ColumnStyles.Add(new ColumnStyle(oldColTypes[i], oldColSizes[i]));
+
+                for (int i = 0; i < oldRowTypes.Length; i++)
+                    tblGrid.RowStyles.Add(new RowStyle(oldRowTypes[i], oldRowSizes[i]));
+
+                tblGrid.PerformLayout();
+                tblGrid.Refresh();
+
+                LayoutSquareGrid();
+            }
         }
 
         protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
