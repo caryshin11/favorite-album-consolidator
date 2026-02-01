@@ -9,7 +9,7 @@ using SoundShelf.Models;
 using SoundShelf.Services;
 using WMPLib;
 
-namespace SoundShelf
+namespace SoundShelf.Audio
 {
     /// <summary>
     /// iTunes preview playback + caching + hover-only inset controls with fade.

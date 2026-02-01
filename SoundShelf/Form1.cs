@@ -1,8 +1,9 @@
+using SoundShelf.Audio;
 using SoundShelf.Models;
 using SoundShelf.Services;
 using System.Drawing;
-using WMPLib;
 using System.Linq;
+using WMPLib;
 
 namespace SoundShelf
 {
