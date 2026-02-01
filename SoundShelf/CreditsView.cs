@@ -13,11 +13,9 @@ namespace SoundShelf
         {
             Dock = DockStyle.Fill;
             BackColor = Color.FromArgb(18, 18, 22);
-
-            // Keep top tighter, sides comfy
             Padding = new Padding(20, 10, 20, 20);
 
-            // ---- Title (TOP) ----
+            // Title (TOP) 
             var title = new Label
             {
                 Dock = DockStyle.Top,
@@ -30,7 +28,7 @@ namespace SoundShelf
                 Margin = Padding.Empty
             };
 
-            // ---- Icons row (EVENLY SPACED) ----
+            // Icons row
             var iconRow = new TableLayoutPanel
             {
                 Dock = DockStyle.Top,
@@ -57,7 +55,7 @@ namespace SoundShelf
             iconRow.Controls.Add(pbLastFm, 0, 0);
             iconRow.Controls.Add(pbItunes, 1, 0);
 
-            // ---- Divider (optional) ----
+            // Divider
             var divider = new Panel
             {
                 Dock = DockStyle.Top,
@@ -66,7 +64,7 @@ namespace SoundShelf
                 Margin = new Padding(0, 16, 0, 16)
             };
 
-            // ---- Text (BOTTOM) ----
+            // Text
             _text.Dock = DockStyle.Fill;
             _text.ForeColor = Color.FromArgb(235, 235, 245);
             _text.Font = new Font(new FontFamily("Segoe UI"), 9f, FontStyle.Regular);
@@ -76,7 +74,7 @@ namespace SoundShelf
                 "SoundShelf is not affiliated with any of the above services.";
             _text.Padding = new Padding(0, 20, 0, 0);
 
-            // Add Fill first, then Top items last
+            // Add Fill first
             Controls.Add(_text);
             Controls.Add(divider);
             Controls.Add(iconRow);
@@ -119,7 +117,7 @@ namespace SoundShelf
                 if (!File.Exists(fullPath))
                     return null;
 
-                // Load into memory so we don't lock the file
+                // Load into memory 
                 using var fs = new FileStream(fullPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
                 using var ms = new MemoryStream();
                 fs.CopyTo(ms);
@@ -144,7 +142,7 @@ namespace SoundShelf
             }
             catch
             {
-                // Optional: swallow silently or show a MessageBox
+
             }
         }
     }

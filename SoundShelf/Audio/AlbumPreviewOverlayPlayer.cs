@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Linq;
@@ -12,8 +13,6 @@ namespace SoundShelf.Audio
 {
     using WinFormsTimer = System.Windows.Forms.Timer;
 
-    /// Overlay controls + preview playback using PreviewAudioEngine (NAudio).
-    /// Includes near-end crossfade into next track.
     public sealed class AlbumPreviewOverlayPlayer : IDisposable
     {
         private readonly ItunesPreviewService _previewService;
@@ -28,6 +27,9 @@ namespace SoundShelf.Audio
         private readonly Dictionary<string, Queue<string>> _recentByAlbum = new(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, HashSet<string>> _recentSetByAlbum = new(StringComparer.OrdinalIgnoreCase);
 
+        // Progress bar per tile
+        private readonly Dictionary<PictureBox, PreviewProgressBar> _tileProgress = new();
+        private readonly WinFormsTimer _progressPoll = new WinFormsTimer { Interval = 50 }; // smooth
 
         private const string NowPlayingPrefix = "NOW PLAYING · ";
 
@@ -127,6 +129,9 @@ namespace SoundShelf.Audio
 
             _crossfadePoll.Tick += (s, e) => CrossfadePollTick();
             _crossfadePoll.Start();
+
+            _progressPoll.Tick += (s, e) => ProgressPollTick();
+            _progressPoll.Start();
         }
 
         public void Dispose()
@@ -137,7 +142,10 @@ namespace SoundShelf.Audio
             try { _crossfadePoll.Stop(); } catch { }
             try { _crossfadePoll.Dispose(); } catch { }
 
-            // Engine is owned by Form1; don't Dispose it here.
+            try { _progressPoll.Stop(); } catch { }
+            try { _progressPoll.Dispose(); } catch { }
+
+            // Engine owned by Form1; stopping is fine
             try { _engine.Stop(); } catch { }
         }
 
@@ -152,7 +160,22 @@ namespace SoundShelf.Audio
             if (tileLabel != null)
                 _tileLabelMap[coverPictureBox] = tileLabel;
 
-            // --- overlay bar ---
+            // ---- Progress bar ON TOP OF COVER ART ----
+            var prog = new PreviewProgressBar
+            {
+                Dock = DockStyle.Bottom,
+                Height = 4,
+                Visible = false,
+                Margin = Padding.Empty
+            };
+
+            // IMPORTANT: add to the PictureBox, not the cell container
+            coverPictureBox.Controls.Add(prog);
+            prog.BringToFront();
+
+            _tileProgress[coverPictureBox] = prog;
+
+            // overlay bar
             var bar = new TableLayoutPanel
             {
                 ColumnCount = 3,
@@ -200,7 +223,7 @@ namespace SoundShelf.Audio
             cellContainer.Controls.Add(bar);
             bar.BringToFront();
 
-            // --- fade + sizing ---
+            // fade + sizing
             const int inset = 8;
             const int maxBgAlpha = 90;
             const int maxIconAlpha = 255;
@@ -314,6 +337,9 @@ namespace SoundShelf.Audio
                 try { hoverPoll.Dispose(); } catch { }
                 try { fadeTimer.Stop(); } catch { }
                 try { fadeTimer.Dispose(); } catch { }
+
+                // cleanup progress bar registry
+                _tileProgress.Remove(coverPictureBox);
             };
 
             ApplyAlpha();
@@ -337,6 +363,84 @@ namespace SoundShelf.Audio
             };
         }
 
+        // ---------------- Progress Poll ----------------
+
+        private void ProgressPollTick()
+        {
+            // Remove disposed entries
+            var dead = _tileProgress.Where(kv => kv.Key.IsDisposed || kv.Value.IsDisposed).Select(kv => kv.Key).ToList();
+            foreach (var k in dead) _tileProgress.Remove(k);
+
+            if (_activeCoverPb == null) { HideAllProgress(); return; }
+            if (!_tileProgress.TryGetValue(_activeCoverPb, out var bar) || bar.IsDisposed) return;
+
+            // Only show while actively playing
+            if (!_isPlaying || _engine.PlaybackState != NAudio.Wave.PlaybackState.Playing)
+            {
+                bar.Visible = false;
+                bar.Progress = 0f;
+                return;
+            }
+
+            float? p = null;
+
+            // Preferred: engine provides progress 0..1
+            try
+            {
+                p = _engine.GetCurrentProgress01();
+            }
+            catch
+            {
+                try
+                {
+                    double? rem = _engine.GetCurrentRemainingSeconds();
+                    double? dur = _engine.GetCurrentDurationSeconds();
+
+                    if (rem.HasValue && dur.HasValue && dur.Value > 0)
+                    {
+                        p = (float)Math.Max(
+                            0.0,
+                            Math.Min(1.0, 1.0 - (rem.Value / dur.Value))
+                        );
+                    }
+                }
+                catch
+                {
+                    p = null;
+                }
+            }
+
+            if (p == null)
+            {
+                bar.Visible = false;
+                bar.Progress = 0f;
+                return;
+            }
+
+            bar.Visible = true;
+            bar.Progress = Math.Max(0f, Math.Min(1f, p.Value));
+
+            // Hide other tiles’ progress bars
+            foreach (var kv in _tileProgress)
+            {
+                if (!ReferenceEquals(kv.Key, _activeCoverPb) && kv.Value != null && !kv.Value.IsDisposed)
+                {
+                    kv.Value.Visible = false;
+                    kv.Value.Progress = 0f;
+                }
+            }
+        }
+
+        private void HideAllProgress()
+        {
+            foreach (var kv in _tileProgress)
+            {
+                if (kv.Value == null || kv.Value.IsDisposed) continue;
+                kv.Value.Visible = false;
+                kv.Value.Progress = 0f;
+            }
+        }
+
         // ---------------- Tile label ----------------
 
         private void SetActiveTile(PictureBox newPb)
@@ -346,6 +450,9 @@ namespace SoundShelf.Audio
 
             _activeCoverPb = newPb;
             _activeTileLabel = _tileLabelMap.TryGetValue(newPb, out var lbl) ? lbl : null;
+
+            // When switching tiles, ensure only the new tile can show progress
+            ProgressPollTick();
         }
 
         private void UpdateActiveTileLabelToSong(PreviewTrack track)
@@ -414,6 +521,7 @@ namespace SoundShelf.Audio
             _currentTrackIndex = tracks.FindIndex(t => t.PreviewUrl == chosen.PreviewUrl);
             PlayTrack(chosen, AlbumKey(album), tilePb);
         }
+
         private void RememberRecent(string albumKey, string previewUrl)
         {
             if (string.IsNullOrWhiteSpace(albumKey) || string.IsNullOrWhiteSpace(previewUrl))
@@ -491,7 +599,6 @@ namespace SoundShelf.Audio
             return map.Values.First();
         }
 
-
         private void PlayTrack(PreviewTrack track, string albumKey, PictureBox tilePb)
         {
             _engine.Stop();
@@ -523,6 +630,9 @@ namespace SoundShelf.Audio
             _isPlaying = true;
             UpdateActiveTileLabelToSong(track);
             UpdateAllPlayIconsSafe();
+
+            // ensure bar appears immediately
+            ProgressPollTick();
         }
 
         private void TogglePlayPause()
@@ -542,6 +652,7 @@ namespace SoundShelf.Audio
             }
 
             UpdateAllPlayIconsSafe();
+            ProgressPollTick();
         }
 
         private void Previous()
@@ -559,6 +670,8 @@ namespace SoundShelf.Audio
                     _isPlaying = true;
                     UpdateActiveTileLabelToSong(_currentTrack);
                     UpdateAllPlayIconsSafe();
+
+                    ProgressPollTick();
                 }
                 return;
             }
@@ -590,6 +703,8 @@ namespace SoundShelf.Audio
             _isPlaying = true;
             UpdateActiveTileLabelToSong(entry.Track);
             UpdateAllPlayIconsSafe();
+
+            ProgressPollTick();
         }
 
         private void PollPlaybackState()
@@ -609,7 +724,9 @@ namespace SoundShelf.Audio
                 else
                 {
                     RestoreActiveTileLabelToAlbum();
+                    HideAllProgress();
                 }
+
                 UpdateAllPlayIconsSafe();
             });
         }
@@ -635,12 +752,9 @@ namespace SoundShelf.Audio
                 // crossfade should follow the same shuffle logic as "Skip"
                 string key = AlbumKey(album);
 
-                // this will avoid repeats.
                 var next = PickNextShuffleTrack(key, _currentTrackList);
-
                 if (next == null || string.IsNullOrWhiteSpace(next.PreviewUrl)) return;
 
-                // keep index in sync (for any code that still references _currentTrackIndex)
                 _currentTrackIndex = _currentTrackList.FindIndex(t =>
                     string.Equals(t.PreviewUrl, next.PreviewUrl, StringComparison.OrdinalIgnoreCase));
 
@@ -650,17 +764,19 @@ namespace SoundShelf.Audio
                 UpdateActiveTileLabelToSong(next);
                 UpdateAllPlayIconsSafe();
 
-                // if added recent tracking
-                // RememberRecent(key, next.PreviewUrl);
+                // Remember it now so skip won't bounce back to the previous during fade window
+                RememberRecent(key, next.PreviewUrl);
 
                 _engine.CrossfadeTo(next.PreviewUrl, CrossfadeMs);
+
+                // progress will keep updating as engine updates time
+                ProgressPollTick();
             }
             else
             {
                 _crossfadeArmed = false;
             }
         }
-
 
         // ---------------- UI helpers ----------------
 
@@ -807,6 +923,59 @@ namespace SoundShelf.Audio
                 }
             }
             action();
+        }
+
+        // ---------------- Progress Bar Control ----------------
+
+        internal sealed class PreviewProgressBar : Control
+        {
+            private float _progress; // 0..1
+
+            [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+            public float Progress
+            {
+                get => _progress;
+                set
+                {
+                    _progress = Math.Max(0f, Math.Min(1f, value));
+                    Invalidate();
+                }
+            }
+
+            [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+            public Color TrackColor { get; set; } = Color.FromArgb(40, 255, 255, 255);
+
+            [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+            public Color FillColor { get; set; } = Color.FromArgb(200, 255, 255, 255);
+
+            public PreviewProgressBar()
+            {
+                SetStyle(ControlStyles.AllPaintingInWmPaint |
+                         ControlStyles.OptimizedDoubleBuffer |
+                         ControlStyles.UserPaint |
+                         ControlStyles.ResizeRedraw, true);
+
+                Height = 4;
+                TabStop = false;
+            }
+
+            protected override void OnPaint(PaintEventArgs e)
+            {
+                e.Graphics.Clear(Parent?.BackColor ?? BackColor);
+
+                var r = ClientRectangle;
+                if (r.Width <= 0 || r.Height <= 0) return;
+
+                using (var track = new SolidBrush(TrackColor))
+                    e.Graphics.FillRectangle(track, r);
+
+                int w = (int)Math.Round(r.Width * _progress);
+                if (w > 0)
+                {
+                    using var fill = new SolidBrush(FillColor);
+                    e.Graphics.FillRectangle(fill, new Rectangle(r.X, r.Y, w, r.Height));
+                }
+            }
         }
     }
 }

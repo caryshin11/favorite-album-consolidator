@@ -207,6 +207,38 @@ namespace SoundShelf.Audio
             catch { return null; }
         }
 
+        /// <summary> Total seconds of the "current" stream (A) if known. </summary>
+        public double? GetCurrentDurationSeconds()
+        {
+            try
+            {
+                if (_readerA == null) return null;
+                double total = _readerA.TotalTime.TotalSeconds;
+                return total > 0 ? total : null;
+            }
+            catch { return null; }
+        }
+
+        /// <summary> Progress 0..1 of the "current" stream (A) if known. </summary>
+        public float? GetCurrentProgress01()
+        {
+            try
+            {
+                if (_readerA == null) return null;
+
+                double total = _readerA.TotalTime.TotalSeconds;
+                if (total <= 0) return null;
+
+                double cur = _readerA.CurrentTime.TotalSeconds;
+                if (cur < 0) cur = 0;
+                if (cur > total) cur = total;
+
+                return (float)(cur / total);
+            }
+            catch { return null; }
+        }
+
+
         // ---------------- Internals ----------------
 
         private void EnsureGraph()
