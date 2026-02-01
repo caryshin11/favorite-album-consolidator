@@ -10,7 +10,7 @@ namespace SoundShelf.Audio
     public static class EqualizerConfig
     {
         // --- FFT / bar layout ---
-        public const int BarCount = 48;      // try 32 / 48 / 64
+        public const int BarCount = 24;      // try 32 / 48 / 64
         public const int FftSize = 2048;     // 1024 / 2048 / 4096 (power of 2)
 
         // --- Animation feel (EqualizerControl smoothing) ---

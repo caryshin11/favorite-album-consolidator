@@ -2,7 +2,9 @@ using SoundShelf.Audio;
 using SoundShelf.Models;
 using SoundShelf.Services;       
 using System.Drawing;
+using System.Drawing.Imaging;
 using System.Linq;
+using System.IO;
 
 namespace SoundShelf
 {
@@ -181,7 +183,17 @@ namespace SoundShelf
             split.FixedPanel = FixedPanel.Panel1;
             split.Panel1MinSize = 220;
 
-            // Left: results
+            // --- LEFT SIDE: results + credits split ---
+            var leftSplit = new SplitContainer
+            {
+                Dock = DockStyle.Fill,
+                Orientation = Orientation.Horizontal,
+                FixedPanel = FixedPanel.Panel2,
+                IsSplitterFixed = true,
+                SplitterWidth = 1
+            };
+
+            // Top: results
             pnlResults.Dock = DockStyle.Fill;
             pnlResults.AutoScroll = true;
             pnlResults.Padding = new Padding(0, 75, 0, 0);
@@ -191,8 +203,27 @@ namespace SoundShelf
             pnlResults.DragEnter += Results_DragEnter;
             pnlResults.DragDrop += Results_DragDrop;
 
+            // Bottom: credits
+            var credits = new SoundShelf.CreditsView();
+            leftSplit.Panel1MinSize = 120;
+            leftSplit.Panel2MinSize = 140;
+
+            leftSplit.HandleCreated += (s, e) =>
+            {
+                int totalH = leftSplit.ClientSize.Height;
+                int desiredCredits = 300;
+
+                int splitter = Math.Max(leftSplit.Panel1MinSize, totalH - desiredCredits);
+                splitter = Math.Min(splitter, totalH - leftSplit.Panel2MinSize);
+
+                leftSplit.SplitterDistance = splitter;
+            };
+            leftSplit.Panel1.Controls.Add(pnlResults);
+            leftSplit.Panel2.Controls.Add(credits);
+
+            // Attach to main split
             split.Panel1.Controls.Clear();
-            split.Panel1.Controls.Add(pnlResults);
+            split.Panel1.Controls.Add(leftSplit);
 
             // Right: grid host (equalizer behind grid, but same layout)
             gridHost.Dock = DockStyle.Fill;
@@ -624,9 +655,161 @@ namespace SoundShelf
         // Your ExportGridPng stays exactly as you had it (unchanged)
         void ExportGridPng(string path)
         {
-            // ... keep your existing ExportGridPng implementation ...
-            // (omitted here to keep this message readable)
+            const int TargetW = 1395;
+            const int TargetH = 1595;
+
+            // Export-only label bump (tweak if you want)
+            const float ExportLabelFontSize = 11.5f;
+            const int ExportLabelHeight = 40;
+
+            // Ensure .png extension (SaveFileDialog usually does this, but not always)
+            if (!path.EndsWith(".png", StringComparison.OrdinalIgnoreCase))
+                path += ".png";
+
+            // Make sure directory exists
+            var dir = Path.GetDirectoryName(path);
+            if (!string.IsNullOrWhiteSpace(dir) && !Directory.Exists(dir))
+                Directory.CreateDirectory(dir);
+
+            // --- Save current state ---
+            int oldW = tblGrid.Width;
+            int oldH = tblGrid.Height;
+
+            Padding oldPadding = tblGrid.Padding;
+            Padding oldMargin = tblGrid.Margin;
+            var oldDock = tblGrid.Dock;
+            var oldAnchor = tblGrid.Anchor;
+
+            // Save row/col SizeType + size
+            int colCount = tblGrid.ColumnStyles.Count;
+            int rowCount = tblGrid.RowStyles.Count;
+
+            SizeType[] oldColTypes = new SizeType[colCount];
+            float[] oldColSizes = new float[colCount];
+
+            SizeType[] oldRowTypes = new SizeType[rowCount];
+            float[] oldRowSizes = new float[rowCount];
+
+            for (int i = 0; i < colCount; i++)
+            {
+                oldColTypes[i] = tblGrid.ColumnStyles[i].SizeType;
+                oldColSizes[i] = tblGrid.ColumnStyles[i].Width;
+            }
+
+            for (int i = 0; i < rowCount; i++)
+            {
+                oldRowTypes[i] = tblGrid.RowStyles[i].SizeType;
+                oldRowSizes[i] = tblGrid.RowStyles[i].Height;
+            }
+
+            // Save label font + height so we can restore
+            List<Label> labels = new();
+            Dictionary<Label, Font> oldFonts = new();
+            Dictionary<Label, int> oldHeights = new();
+
+            foreach (Control cell in tblGrid.Controls)
+            {
+                foreach (Control c in cell.Controls)
+                {
+                    if (c is Label lbl)
+                    {
+                        labels.Add(lbl);
+                        oldFonts[lbl] = lbl.Font;
+                        oldHeights[lbl] = lbl.Height;
+                    }
+                }
+            }
+
+            try
+            {
+                // --- TEMP export layout: remove UI padding/margins so export is exact ---
+                tblGrid.Padding = Padding.Empty;
+                tblGrid.Margin = Padding.Empty;
+                tblGrid.Dock = DockStyle.None;
+                tblGrid.Anchor = AnchorStyles.None;
+
+                // --- TEMP: make labels bigger for export ---
+                foreach (var lbl in labels)
+                {
+                    lbl.Font = new Font(lbl.Font.FontFamily, ExportLabelFontSize, lbl.Font.Style);
+                    lbl.Height = ExportLabelHeight;
+                }
+
+                // --- Force exact fixed output size ---
+                tblGrid.Width = TargetW;
+                tblGrid.Height = TargetH;
+
+                // --- Force absolute sizing ---
+                int baseCol = TargetW / 5;
+                int extraCols = TargetW % 5;
+
+                int baseRow = TargetH / 5;
+                int extraRows = TargetH % 5;
+
+                tblGrid.ColumnStyles.Clear();
+                tblGrid.RowStyles.Clear();
+
+                for (int i = 0; i < 5; i++)
+                {
+                    int w = baseCol + (i < extraCols ? 1 : 0);
+                    tblGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, w));
+                }
+
+                for (int i = 0; i < 5; i++)
+                {
+                    int h = baseRow + (i < extraRows ? 1 : 0);
+                    tblGrid.RowStyles.Add(new RowStyle(SizeType.Absolute, h));
+                }
+
+                tblGrid.PerformLayout();
+                tblGrid.Refresh();
+                Application.DoEvents(); // helps ensure images/layout are ready before capture
+
+                using Bitmap bmp = new Bitmap(TargetW, TargetH);
+                tblGrid.DrawToBitmap(bmp, new Rectangle(0, 0, TargetW, TargetH));
+                bmp.Save(path, ImageFormat.Png);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("Export failed: " + ex.Message, "Export to PNG",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+            finally
+            {
+                // --- Restore labels ---
+                foreach (var lbl in labels)
+                {
+                    lbl.Font = oldFonts[lbl];
+                    lbl.Height = oldHeights[lbl];
+                }
+
+                // --- Restore grid layout ---
+                tblGrid.Width = oldW;
+                tblGrid.Height = oldH;
+
+                tblGrid.Padding = oldPadding;
+                tblGrid.Margin = oldMargin;
+                tblGrid.Dock = oldDock;
+                tblGrid.Anchor = oldAnchor;
+
+                // Restore styles exactly
+                tblGrid.ColumnStyles.Clear();
+                tblGrid.RowStyles.Clear();
+
+                for (int i = 0; i < oldColTypes.Length; i++)
+                    tblGrid.ColumnStyles.Add(new ColumnStyle(oldColTypes[i], oldColSizes[i]));
+
+                for (int i = 0; i < oldRowTypes.Length; i++)
+                    tblGrid.RowStyles.Add(new RowStyle(oldRowTypes[i], oldRowSizes[i]));
+
+                tblGrid.PerformLayout();
+                tblGrid.Refresh();
+
+                // If you have LayoutSquareGrid(), call it to re-center after restore:
+                LayoutSquareGrid();
+            }
         }
+
 
         protected override void OnFormClosed(FormClosedEventArgs e)
         {

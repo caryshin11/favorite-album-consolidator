@@ -23,6 +23,12 @@ namespace SoundShelf.Audio
 
         private readonly Dictionary<string, List<PreviewTrack>> _albumPreviewCache = new();
 
+        // Avoid repeats (per album)
+        private const int RecentPerAlbum = 8;
+        private readonly Dictionary<string, Queue<string>> _recentByAlbum = new(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, HashSet<string>> _recentSetByAlbum = new(StringComparer.OrdinalIgnoreCase);
+
+
         private const string NowPlayingPrefix = "NOW PLAYING · ";
 
         // Playback state
@@ -408,14 +414,42 @@ namespace SoundShelf.Audio
             _currentTrackIndex = tracks.FindIndex(t => t.PreviewUrl == chosen.PreviewUrl);
             PlayTrack(chosen, AlbumKey(album), tilePb);
         }
+        private void RememberRecent(string albumKey, string previewUrl)
+        {
+            if (string.IsNullOrWhiteSpace(albumKey) || string.IsNullOrWhiteSpace(previewUrl))
+                return;
+
+            if (!_recentByAlbum.TryGetValue(albumKey, out var q))
+                _recentByAlbum[albumKey] = q = new Queue<string>();
+
+            if (!_recentSetByAlbum.TryGetValue(albumKey, out var set))
+                _recentSetByAlbum[albumKey] = set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            if (set.Contains(previewUrl))
+            {
+                var tmp = q.Where(u => !string.Equals(u, previewUrl, StringComparison.OrdinalIgnoreCase)).ToList();
+                q.Clear();
+                set.Clear();
+                foreach (var u in tmp) { q.Enqueue(u); set.Add(u); }
+            }
+
+            q.Enqueue(previewUrl);
+            set.Add(previewUrl);
+
+            while (q.Count > RecentPerAlbum)
+                set.Remove(q.Dequeue());
+        }
+
+        private bool IsRecent(string albumKey, string previewUrl)
+        {
+            return _recentSetByAlbum.TryGetValue(albumKey, out var set) &&
+                   set.Contains(previewUrl);
+        }
 
         private PreviewTrack PickNextShuffleTrack(string albumKey, List<PreviewTrack> tracks)
         {
             if (!_shuffleByAlbum.TryGetValue(albumKey, out var st))
-            {
-                st = new ShuffleState();
-                _shuffleByAlbum[albumKey] = st;
-            }
+                _shuffleByAlbum[albumKey] = st = new ShuffleState();
 
             if (st.OrderUrls.Count == 0 || st.Exhausted || st.TrackCountSnapshot != tracks.Count)
                 st.Reset(tracks, _rng);
@@ -425,36 +459,38 @@ namespace SoundShelf.Audio
                 .GroupBy(t => t.PreviewUrl, StringComparer.OrdinalIgnoreCase)
                 .ToDictionary(g => g.Key, g => g.First(), StringComparer.OrdinalIgnoreCase);
 
-            while (true)
+            int total = map.Count;
+            int recentLimit = Math.Min(RecentPerAlbum, Math.Max(1, total - 1));
+            int guard = Math.Max(12, total * 2);
+
+            while (guard-- > 0)
             {
-                if (st.Exhausted) st.Reset(tracks, _rng);
+                if (st.Exhausted)
+                    st.Reset(tracks, _rng);
 
-                string nextUrl = st.OrderUrls[st.Pos];
+                string url = st.OrderUrls[st.Pos++];
+                if (!map.TryGetValue(url, out var track))
+                    continue;
 
-                if (_currentTrack != null && map.Count > 1 &&
-                    string.Equals(nextUrl, _currentTrack.PreviewUrl, StringComparison.OrdinalIgnoreCase))
-                {
-                    int swapIndex = -1;
-                    for (int i = st.Pos + 1; i < st.OrderUrls.Count; i++)
-                    {
-                        if (!string.Equals(st.OrderUrls[i], _currentTrack.PreviewUrl, StringComparison.OrdinalIgnoreCase))
-                        {
-                            swapIndex = i;
-                            break;
-                        }
-                    }
-                    if (swapIndex >= 0)
-                        (st.OrderUrls[st.Pos], st.OrderUrls[swapIndex]) = (st.OrderUrls[swapIndex], st.OrderUrls[st.Pos]);
+                bool immediateRepeat =
+                    _currentTrack != null &&
+                    string.Equals(track.PreviewUrl, _currentTrack.PreviewUrl, StringComparison.OrdinalIgnoreCase);
 
-                    nextUrl = st.OrderUrls[st.Pos];
-                }
+                bool recent =
+                    recentLimit > 0 &&
+                    IsRecent(albumKey, track.PreviewUrl) &&
+                    total > 1;
 
-                st.Pos++;
+                if (immediateRepeat || recent)
+                    continue;
 
-                if (map.TryGetValue(nextUrl, out var track))
-                    return track;
+                return track;
             }
+
+            // Fallback (small albums)
+            return map.Values.First();
         }
+
 
         private void PlayTrack(PreviewTrack track, string albumKey, PictureBox tilePb)
         {
@@ -475,6 +511,9 @@ namespace SoundShelf.Audio
 
             _currentTrack = track;
             _currentAlbumKey = albumKey;
+
+            // remember what actually played
+            RememberRecent(albumKey, track.PreviewUrl);
 
             SetActiveTile(tilePb);
 
@@ -593,17 +632,26 @@ namespace SoundShelf.Audio
                 if (_crossfadeArmed) return;
                 _crossfadeArmed = true;
 
-                int nextIndex = _currentTrackIndex < 0 ? 0 : (_currentTrackIndex + 1) % _currentTrackList.Count;
-                _currentTrackIndex = nextIndex;
+                // crossfade should follow the same shuffle logic as "Skip"
+                string key = AlbumKey(album);
 
-                var next = _currentTrackList[nextIndex];
-                if (string.IsNullOrWhiteSpace(next.PreviewUrl)) return;
+                // this will avoid repeats.
+                var next = PickNextShuffleTrack(key, _currentTrackList);
+
+                if (next == null || string.IsNullOrWhiteSpace(next.PreviewUrl)) return;
+
+                // keep index in sync (for any code that still references _currentTrackIndex)
+                _currentTrackIndex = _currentTrackList.FindIndex(t =>
+                    string.Equals(t.PreviewUrl, next.PreviewUrl, StringComparison.OrdinalIgnoreCase));
 
                 // Update UI to incoming track
                 _currentTrack = next;
-                _currentAlbumKey = AlbumKey(album);
+                _currentAlbumKey = key;
                 UpdateActiveTileLabelToSong(next);
                 UpdateAllPlayIconsSafe();
+
+                // if added recent tracking
+                // RememberRecent(key, next.PreviewUrl);
 
                 _engine.CrossfadeTo(next.PreviewUrl, CrossfadeMs);
             }
@@ -612,6 +660,7 @@ namespace SoundShelf.Audio
                 _crossfadeArmed = false;
             }
         }
+
 
         // ---------------- UI helpers ----------------
 
