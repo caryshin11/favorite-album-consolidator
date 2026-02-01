@@ -76,6 +76,39 @@ namespace SoundShelf
             public required Func<int> GetIconAlpha { get; init; }
         }
 
+        // ---- Shuffle-cycle state per album (no repeats until exhausted) ----
+        private sealed class ShuffleState
+        {
+            public List<string> OrderUrls = new();
+            public int Pos = 0;
+
+            // If cache refreshed / album track list changes, rebuild
+            public int TrackCountSnapshot = 0;
+
+            public void Reset(List<PreviewTrack> tracks, Random rng)
+            {
+                OrderUrls = tracks
+                    .Where(t => !string.IsNullOrWhiteSpace(t.PreviewUrl))
+                    .Select(t => t.PreviewUrl)
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+
+                // Fisher–Yates shuffle
+                for (int i = OrderUrls.Count - 1; i > 0; i--)
+                {
+                    int j = rng.Next(i + 1);
+                    (OrderUrls[i], OrderUrls[j]) = (OrderUrls[j], OrderUrls[i]);
+                }
+
+                Pos = 0;
+                TrackCountSnapshot = tracks.Count;
+            }
+
+            public bool Exhausted => Pos >= OrderUrls.Count;
+        }
+
+        private readonly Dictionary<string, ShuffleState> _shuffleByAlbum = new();
+
         // Volume
         private int _baseVolume = 80;
         public int Volume
@@ -432,7 +465,9 @@ namespace SoundShelf
             // keep list so crossfade can go "next"
             _currentTrackList = tracks;
 
-            var chosen = tracks[_rng.Next(tracks.Count)];
+            string key = AlbumKey(album);
+
+            var chosen = PickNextShuffleTrack(key, tracks);
 
             // Avoid immediate repeat if possible
             if (_currentTrack != null && tracks.Count > 1 && chosen.PreviewUrl == _currentTrack.PreviewUrl)
@@ -447,6 +482,63 @@ namespace SoundShelf
             _currentTrackIndex = tracks.FindIndex(t => t.PreviewUrl == chosen.PreviewUrl);
 
             PlayTrack(chosen, AlbumKey(album), tilePb);
+        }
+
+        private PreviewTrack PickNextShuffleTrack(string albumKey, List<PreviewTrack> tracks)
+        {
+            if (!_shuffleByAlbum.TryGetValue(albumKey, out var st))
+            {
+                st = new ShuffleState();
+                _shuffleByAlbum[albumKey] = st;
+            }
+
+            // If first time, exhausted, or list changed size -> reshuffle
+            if (st.OrderUrls.Count == 0 || st.Exhausted || st.TrackCountSnapshot != tracks.Count)
+                st.Reset(tracks, _rng);
+
+            // Make a lookup for url -> track
+            var map = tracks
+                .Where(t => !string.IsNullOrWhiteSpace(t.PreviewUrl))
+                .GroupBy(t => t.PreviewUrl, StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(g => g.Key, g => g.First(), StringComparer.OrdinalIgnoreCase);
+
+            // Choose next url that exists in map (cache might change)
+            while (true)
+            {
+                if (st.Exhausted)
+                {
+                    st.Reset(tracks, _rng);
+                }
+
+                string nextUrl = st.OrderUrls[st.Pos];
+
+                // Avoid immediate repeat if possible (only matters at cycle boundaries, or weird cache changes)
+                if (_currentTrack != null && map.Count > 1 &&
+                    string.Equals(nextUrl, _currentTrack.PreviewUrl, StringComparison.OrdinalIgnoreCase))
+                {
+                    // Swap with a later different one if we can
+                    int swapIndex = -1;
+                    for (int i = st.Pos + 1; i < st.OrderUrls.Count; i++)
+                    {
+                        if (!string.Equals(st.OrderUrls[i], _currentTrack.PreviewUrl, StringComparison.OrdinalIgnoreCase))
+                        {
+                            swapIndex = i;
+                            break;
+                        }
+                    }
+                    if (swapIndex >= 0)
+                        (st.OrderUrls[st.Pos], st.OrderUrls[swapIndex]) = (st.OrderUrls[swapIndex], st.OrderUrls[st.Pos]);
+
+                    nextUrl = st.OrderUrls[st.Pos];
+                }
+
+                st.Pos++;
+
+                if (map.TryGetValue(nextUrl, out var track))
+                    return track;
+
+                // If url not present anymore, continue loop (rare)
+            }
         }
 
         private void PlayTrack(PreviewTrack track, string albumKey, PictureBox tilePb)
