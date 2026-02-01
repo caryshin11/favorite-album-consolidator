@@ -362,7 +362,7 @@ namespace SoundShelf
                 PictureBox pb = new()
                 {
                     Dock = DockStyle.Fill,
-                    BorderStyle = BorderStyle.FixedSingle,
+                    BorderStyle = BorderStyle.None,
                     SizeMode = PictureBoxSizeMode.Zoom,
                     AllowDrop = true,
                     BackColor = Color.Black

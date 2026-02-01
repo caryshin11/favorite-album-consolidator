@@ -1,8 +1,6 @@
 ﻿using System;
-using System.Collections.Generic;
-using System.Text;
-
 using System.Drawing;
+using System.Drawing.Drawing2D;
 using System.Windows.Forms;
 using Timer = System.Windows.Forms.Timer;
 
@@ -26,6 +24,10 @@ namespace SoundShelf
 
         [System.ComponentModel.DefaultValue(700)]
         public int StartDelayMs { get; set; } = 700;   // pause before scrolling starts
+
+        // Rounded corners
+        [System.ComponentModel.DefaultValue(10)]
+        public int CornerRadius { get; set; } = 10;
 
         private int _delayLeftMs = 0;
 
@@ -56,6 +58,7 @@ namespace SoundShelf
         protected override void OnSizeChanged(EventArgs e)
         {
             base.OnSizeChanged(e);
+            UpdateRegion();
             Recalculate();
         }
 
@@ -100,16 +103,34 @@ namespace SoundShelf
             Invalidate();
         }
 
+        // Prevent default square background paint
+        protected override void OnPaintBackground(PaintEventArgs pevent)
+        {
+            // do nothing
+        }
+
         protected override void OnPaint(PaintEventArgs e)
         {
-            base.OnPaint(e);
+            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            e.Graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
 
-            e.Graphics.Clear(BackColor);
+            var r = new Rectangle(0, 0, Width - 1, Height - 1);
+            if (r.Width <= 0 || r.Height <= 0) return;
+
+            using var path = GetRoundedPath(r, CornerRadius);
+
+            // Fill rounded background
+            using (var bg = new SolidBrush(BackColor))
+                e.Graphics.FillPath(bg, path);
 
             if (string.IsNullOrWhiteSpace(Text))
                 return;
 
-            // If it fits, just draw centered
+            // Clip drawing to rounded rect so text doesn't bleed outside corners
+            var oldClip = e.Graphics.Clip;
+            e.Graphics.SetClip(path);
+
+            // If it fits, draw centered
             if (_textWidth <= ClientSize.Width)
             {
                 TextRenderer.DrawText(
@@ -122,16 +143,52 @@ namespace SoundShelf
                     TextFormatFlags.VerticalCenter |
                     TextFormatFlags.EndEllipsis
                 );
-                return;
+            }
+            else
+            {
+                // If it doesn't fit, draw scrolling text repeated
+                var y = (ClientSize.Height - Font.Height) / 2;
+                int x1 = _offsetX;
+                int x2 = x1 + _textWidth + GapPx;
+
+                TextRenderer.DrawText(e.Graphics, Text, Font, new Point(x1, y), ForeColor, BackColor);
+                TextRenderer.DrawText(e.Graphics, Text, Font, new Point(x2, y), ForeColor, BackColor);
             }
 
-            // If it doesn't fit, draw scrolling text repeated
-            var y = (ClientSize.Height - Font.Height) / 2;
-            int x1 = _offsetX;
-            int x2 = x1 + _textWidth + GapPx;
+            // Restore clip
+            e.Graphics.Clip = oldClip;
+        }
 
-            TextRenderer.DrawText(e.Graphics, Text, Font, new Point(x1, y), ForeColor, BackColor);
-            TextRenderer.DrawText(e.Graphics, Text, Font, new Point(x2, y), ForeColor, BackColor);
+        private void UpdateRegion()
+        {
+            if (!IsHandleCreated || Width < 2 || Height < 2) return;
+
+            using var path = GetRoundedPath(new Rectangle(0, 0, Width - 1, Height - 1), CornerRadius);
+            Region?.Dispose();
+            Region = new Region(path);
+        }
+
+        private static GraphicsPath GetRoundedPath(Rectangle r, int radius)
+        {
+            var path = new GraphicsPath();
+
+            if (radius <= 0)
+            {
+                path.AddRectangle(r);
+                path.CloseFigure();
+                return path;
+            }
+
+            int d = radius * 2;
+            d = Math.Min(d, Math.Min(r.Width, r.Height));
+
+            path.AddArc(r.X, r.Y, d, d, 180, 90);
+            path.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+            path.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+            path.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+            path.CloseFigure();
+
+            return path;
         }
 
         protected override void Dispose(bool disposing)
@@ -142,4 +199,3 @@ namespace SoundShelf
         }
     }
 }
-
