@@ -7,57 +7,41 @@ using System.Threading.Tasks;
 using System.Windows.Forms;
 using SoundShelf.Models;
 using SoundShelf.Services;
-using WMPLib;
 
 namespace SoundShelf.Audio
 {
-    /// <summary>
-    /// iTunes preview playback + caching + hover-only inset controls with fade.
-    /// - Only active tile shows Pause while playing.
-    /// - Label shows "NOW PLAYING · Artist - Song" while playing.
-    /// - Label restores to "AlbumArtist - AlbumTitle" when nothing is playing.
-    /// - Skip is random; Previous restarts current if > threshold else goes back in history.
-    /// - Crossfade (dual WMP): near end of preview, fades into next track in list.
-    /// </summary>
+    using WinFormsTimer = System.Windows.Forms.Timer;
+
+    /// Overlay controls + preview playback using PreviewAudioEngine (NAudio).
+    /// Includes near-end crossfade into next track.
     public sealed class AlbumPreviewOverlayPlayer : IDisposable
     {
         private readonly ItunesPreviewService _previewService;
+        private readonly PreviewAudioEngine _engine;
         private readonly Random _rng = new Random();
         private readonly ToolTip _toolTip = new ToolTip();
 
         private readonly Dictionary<string, List<PreviewTrack>> _albumPreviewCache = new();
 
-        private const double RestartThresholdSeconds = 2.0;
         private const string NowPlayingPrefix = "NOW PLAYING · ";
 
-        // Dual players for real crossfade
-        private readonly WindowsMediaPlayer _a = new WindowsMediaPlayer();
-        private readonly WindowsMediaPlayer _b = new WindowsMediaPlayer();
-        private WindowsMediaPlayer _cur;
-        private WindowsMediaPlayer _nxt;
-
-        // Crossfade config
-        public int CrossfadeMs { get; set; } = 700; // tweak: 450–1200
-        private bool _isCrossfading = false;
-        private System.Windows.Forms.Timer? _crossfadePoll;
-        private System.Windows.Forms.Timer? _crossfadeRamp;
+        // Playback state
+        private bool _isPlaying = false;
 
         // Track state
         private string? _currentAlbumKey;
         private PreviewTrack? _currentTrack;
-
         private List<PreviewTrack>? _currentTrackList;
         private int _currentTrackIndex = -1;
 
         // Active tile tracking
-        private bool _isPlaying = false;
         private PictureBox? _activeCoverPb;
 
-        // Labels per tile so we can update/restore correctly
+        // Labels per tile
         private readonly Dictionary<PictureBox, MarqueeLabel> _tileLabelMap = new();
         private MarqueeLabel? _activeTileLabel;
 
-        // History includes which tile it came from (so "previous" can jump across tiles)
+        // History
         private sealed class HistoryEntry
         {
             public required PreviewTrack Track { get; init; }
@@ -66,7 +50,7 @@ namespace SoundShelf.Audio
         }
         private readonly Stack<HistoryEntry> _history = new();
 
-        // Keep references so we can redraw play icons for ALL tiles properly
+        // Play icon registry
         private readonly List<PlayBtnReg> _playButtons = new();
         private sealed class PlayBtnReg
         {
@@ -76,13 +60,11 @@ namespace SoundShelf.Audio
             public required Func<int> GetIconAlpha { get; init; }
         }
 
-        // ---- Shuffle-cycle state per album (no repeats until exhausted) ----
+        // Shuffle cycle per album
         private sealed class ShuffleState
         {
             public List<string> OrderUrls = new();
             public int Pos = 0;
-
-            // If cache refreshed / album track list changes, rebuild
             public int TrackCountSnapshot = 0;
 
             public void Reset(List<PreviewTrack> tracks, Random rng)
@@ -93,7 +75,6 @@ namespace SoundShelf.Audio
                     .Distinct(StringComparer.OrdinalIgnoreCase)
                     .ToList();
 
-                // Fisher–Yates shuffle
                 for (int i = OrderUrls.Count - 1; i > 0; i--)
                 {
                     int j = rng.Next(i + 1);
@@ -106,10 +87,9 @@ namespace SoundShelf.Audio
 
             public bool Exhausted => Pos >= OrderUrls.Count;
         }
-
         private readonly Dictionary<string, ShuffleState> _shuffleByAlbum = new();
 
-        // Volume
+        // Volume passthrough
         private int _baseVolume = 80;
         public int Volume
         {
@@ -117,49 +97,43 @@ namespace SoundShelf.Audio
             set
             {
                 _baseVolume = Math.Max(0, Math.Min(100, value));
-                _cur.settings.volume = _baseVolume;
-                // keep next silent unless crossfading
-                if (!_isCrossfading) _nxt.settings.volume = 0;
+                _engine.SetVolume(_baseVolume);
             }
         }
 
-        public AlbumPreviewOverlayPlayer(ItunesPreviewService previewService, int volume = 80)
+        // State poll (updates label/icons when paused/ended)
+        private readonly WinFormsTimer _statePoll = new WinFormsTimer { Interval = 200 };
+
+        // Crossfade
+        public int CrossfadeMs { get; set; } = 700;
+        private readonly WinFormsTimer _crossfadePoll = new WinFormsTimer { Interval = 120 };
+        private bool _crossfadeArmed = false;
+
+        public AlbumPreviewOverlayPlayer(ItunesPreviewService previewService, PreviewAudioEngine engine, int volume = 80)
         {
             _previewService = previewService ?? throw new ArgumentNullException(nameof(previewService));
-
-            _cur = _a;
-            _nxt = _b;
-
-            SetupPlayer(_a);
-            SetupPlayer(_b);
+            _engine = engine ?? throw new ArgumentNullException(nameof(engine));
 
             Volume = volume;
 
-            // Watch both players; update UI when "any playing" changes
-            _a.PlayStateChange += (st) => OnAnyPlayerStateChange((WMPPlayState)st);
-            _b.PlayStateChange += (st) => OnAnyPlayerStateChange((WMPPlayState)st);
+            _statePoll.Tick += (s, e) => PollPlaybackState();
+            _statePoll.Start();
 
-            // Poll for "near end" to start crossfade
-            _crossfadePoll = new System.Windows.Forms.Timer { Interval = 100 };
             _crossfadePoll.Tick += (s, e) => CrossfadePollTick();
             _crossfadePoll.Start();
         }
 
-        private void SetupPlayer(WindowsMediaPlayer p)
-        {
-            p.settings.autoStart = false;
-            p.settings.mute = false;
-            p.settings.volume = _baseVolume;
-        }
-
         public void Dispose()
         {
-            try { StopBoth(); } catch { }
-            try { _crossfadePoll?.Stop(); } catch { }
-            try { _crossfadePoll?.Dispose(); } catch { }
-        }
+            try { _statePoll.Stop(); } catch { }
+            try { _statePoll.Dispose(); } catch { }
 
-        // ---------- Public API ----------
+            try { _crossfadePoll.Stop(); } catch { }
+            try { _crossfadePoll.Dispose(); } catch { }
+
+            // Engine is owned by Form1; don't Dispose it here.
+            try { _engine.Stop(); } catch { }
+        }
 
         public void AttachOverlay(Control cellContainer, PictureBox coverPictureBox, Action<bool> setHover)
         {
@@ -167,12 +141,12 @@ namespace SoundShelf.Audio
             if (coverPictureBox == null) throw new ArgumentNullException(nameof(coverPictureBox));
             if (setHover == null) throw new ArgumentNullException(nameof(setHover));
 
-            // Grab the tile label once and register it
+            // register tile label
             var tileLabel = cellContainer.Controls.OfType<MarqueeLabel>().FirstOrDefault();
             if (tileLabel != null)
                 _tileLabelMap[coverPictureBox] = tileLabel;
 
-            // --- Bar ---
+            // --- overlay bar ---
             var bar = new TableLayoutPanel
             {
                 ColumnCount = 3,
@@ -181,12 +155,9 @@ namespace SoundShelf.Audio
                 Margin = Padding.Empty,
                 Padding = Padding.Empty
             };
-
-            bar.ColumnStyles.Clear();
             bar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33.33f));
             bar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33.33f));
             bar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33.34f));
-            bar.RowStyles.Clear();
             bar.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
 
             var btnPrev = MakeOverlayButton("Previous", (s, e) =>
@@ -198,10 +169,8 @@ namespace SoundShelf.Audio
             var btnPlay = MakeOverlayButton("Play / Pause", async (s, e) =>
             {
                 if (coverPictureBox.Tag is not Album a) return;
-
                 SetActiveTile(coverPictureBox);
 
-                // If different album or nothing loaded -> start random
                 if (_currentTrack == null || _currentAlbumKey != AlbumKey(a))
                     await PlayRandomAsync(a, coverPictureBox);
                 else
@@ -213,11 +182,8 @@ namespace SoundShelf.Audio
             var btnNext = MakeOverlayButton("Skip (Random)", async (s, e) =>
             {
                 if (coverPictureBox.Tag is not Album a) return;
-
                 SetActiveTile(coverPictureBox);
-
                 await PlayRandomAsync(a, coverPictureBox);
-
                 UpdateAllPlayIconsSafe();
             });
 
@@ -228,7 +194,7 @@ namespace SoundShelf.Audio
             cellContainer.Controls.Add(bar);
             bar.BringToFront();
 
-            // --- Fade + sizing ---
+            // --- fade + sizing ---
             const int inset = 8;
             const int maxBgAlpha = 90;
             const int maxIconAlpha = 255;
@@ -236,18 +202,11 @@ namespace SoundShelf.Audio
             const int step = 18;
 
             int labelHeight = GuessBottomLabelHeight(cellContainer);
-
-            int bgAlpha = 0;
-            int iconAlpha = 0;
-            int targetBgAlpha = 0;
-            int targetIconAlpha = 0;
-
-            int currentIconSize = 18;
-            int currentIconAlpha = 0;
+            int bgAlpha = 0, iconAlpha = 0, targetBgAlpha = 0, targetIconAlpha = 0;
+            int currentIconSize = 18, currentIconAlpha = 0;
 
             bar.Visible = false;
-
-            var fadeTimer = new System.Windows.Forms.Timer { Interval = tickMs };
+            var fadeTimer = new WinFormsTimer { Interval = tickMs };
 
             void ApplyAlpha()
             {
@@ -261,7 +220,6 @@ namespace SoundShelf.Audio
             {
                 int cellW = cellContainer.ClientSize.Width;
                 int cellH = cellContainer.ClientSize.Height;
-
                 int coverH = Math.Max(0, cellH - labelHeight);
 
                 int barH = (int)Math.Round(Math.Max(26, Math.Min(56, coverH * 0.18)));
@@ -287,17 +245,8 @@ namespace SoundShelf.Audio
             {
                 bool done = true;
 
-                if (bgAlpha != targetBgAlpha)
-                {
-                    bgAlpha = MoveToward(bgAlpha, targetBgAlpha, step);
-                    done = false;
-                }
-
-                if (iconAlpha != targetIconAlpha)
-                {
-                    iconAlpha = MoveToward(iconAlpha, targetIconAlpha, step * 2);
-                    done = false;
-                }
+                if (bgAlpha != targetBgAlpha) { bgAlpha = MoveToward(bgAlpha, targetBgAlpha, step); done = false; }
+                if (iconAlpha != targetIconAlpha) { iconAlpha = MoveToward(iconAlpha, targetIconAlpha, step * 2); done = false; }
 
                 ApplyAlpha();
                 RefreshBarSizing();
@@ -325,9 +274,8 @@ namespace SoundShelf.Audio
                 if (!fadeTimer.Enabled) fadeTimer.Start();
             }
 
-            // Robust hover polling (prevents lingering when MouseLeave is missed)
+            // hover polling
             bool lastInside = false;
-
             bool IsCursorInCell()
             {
                 if (!cellContainer.IsHandleCreated) return false;
@@ -335,7 +283,7 @@ namespace SoundShelf.Audio
                 return cellContainer.ClientRectangle.Contains(p);
             }
 
-            var hoverPoll = new System.Windows.Forms.Timer { Interval = 40 };
+            var hoverPoll = new WinFormsTimer { Interval = 40 };
             hoverPoll.Tick += (s, e) =>
             {
                 if (cellContainer.IsDisposed)
@@ -347,19 +295,10 @@ namespace SoundShelf.Audio
 
                 bool inside = IsCursorInCell();
                 if (inside == lastInside) return;
-
                 lastInside = inside;
 
-                if (inside)
-                {
-                    setHover(true);
-                    StartFadeIn();
-                }
-                else
-                {
-                    setHover(false);
-                    StartFadeOut();
-                }
+                if (inside) { setHover(true); StartFadeIn(); }
+                else { setHover(false); StartFadeOut(); }
             };
             hoverPoll.Start();
 
@@ -375,7 +314,6 @@ namespace SoundShelf.Audio
             RefreshBarSizing();
             cellContainer.Resize += (s, e) => RefreshBarSizing();
 
-            // Register this tile's play button for global icon refresh
             _playButtons.Add(new PlayBtnReg
             {
                 CoverPb = coverPictureBox,
@@ -384,37 +322,29 @@ namespace SoundShelf.Audio
                 GetIconAlpha = () => currentIconAlpha
             });
 
-            // Double-click cover = random track
             coverPictureBox.DoubleClick += async (s, e) =>
             {
                 if (coverPictureBox.Tag is not Album a) return;
-
                 SetActiveTile(coverPictureBox);
-
                 await PlayRandomAsync(a, coverPictureBox);
-
                 UpdateAllPlayIconsSafe();
             };
         }
 
-        // ---------- Active tile + label management ----------
+        // ---------------- Tile label ----------------
 
         private void SetActiveTile(PictureBox newPb)
         {
-            // If switching tiles, restore the previous active tile label back to album caption
             if (_activeCoverPb != null && !ReferenceEquals(_activeCoverPb, newPb))
                 RestoreTileLabelToAlbum(_activeCoverPb);
 
             _activeCoverPb = newPb;
-
-            // Cache active label pointer (if exists)
             _activeTileLabel = _tileLabelMap.TryGetValue(newPb, out var lbl) ? lbl : null;
         }
 
         private void UpdateActiveTileLabelToSong(PreviewTrack track)
         {
             if (_activeTileLabel == null || _activeTileLabel.IsDisposed) return;
-
             _activeTileLabel.Text = $"{NowPlayingPrefix}{track.ArtistName} - {track.TrackName}";
         }
 
@@ -429,13 +359,11 @@ namespace SoundShelf.Audio
             if (!_tileLabelMap.TryGetValue(pb, out var lbl)) return;
             if (lbl.IsDisposed) return;
 
-            if (pb.Tag is Album a)
-                lbl.Text = $"{a.Artist} - {a.Title}";
-            else
-                lbl.Text = "";
+            if (pb.Tag is Album a) lbl.Text = $"{a.Artist} - {a.Title}";
+            else lbl.Text = "";
         }
 
-        // ---------- Playback ----------
+        // ---------------- Playback ----------------
 
         private static string AlbumKey(Album a)
             => $"{(a.Artist ?? "").Trim().ToLowerInvariant()}|{(a.Title ?? "").Trim().ToLowerInvariant()}";
@@ -462,14 +390,12 @@ namespace SoundShelf.Audio
                 return;
             }
 
-            // keep list so crossfade can go "next"
             _currentTrackList = tracks;
 
             string key = AlbumKey(album);
-
             var chosen = PickNextShuffleTrack(key, tracks);
 
-            // Avoid immediate repeat if possible
+            // avoid immediate repeat
             if (_currentTrack != null && tracks.Count > 1 && chosen.PreviewUrl == _currentTrack.PreviewUrl)
             {
                 for (int i = 0; i < 4; i++)
@@ -480,7 +406,6 @@ namespace SoundShelf.Audio
             }
 
             _currentTrackIndex = tracks.FindIndex(t => t.PreviewUrl == chosen.PreviewUrl);
-
             PlayTrack(chosen, AlbumKey(album), tilePb);
         }
 
@@ -492,31 +417,23 @@ namespace SoundShelf.Audio
                 _shuffleByAlbum[albumKey] = st;
             }
 
-            // If first time, exhausted, or list changed size -> reshuffle
             if (st.OrderUrls.Count == 0 || st.Exhausted || st.TrackCountSnapshot != tracks.Count)
                 st.Reset(tracks, _rng);
 
-            // Make a lookup for url -> track
             var map = tracks
                 .Where(t => !string.IsNullOrWhiteSpace(t.PreviewUrl))
                 .GroupBy(t => t.PreviewUrl, StringComparer.OrdinalIgnoreCase)
                 .ToDictionary(g => g.Key, g => g.First(), StringComparer.OrdinalIgnoreCase);
 
-            // Choose next url that exists in map (cache might change)
             while (true)
             {
-                if (st.Exhausted)
-                {
-                    st.Reset(tracks, _rng);
-                }
+                if (st.Exhausted) st.Reset(tracks, _rng);
 
                 string nextUrl = st.OrderUrls[st.Pos];
 
-                // Avoid immediate repeat if possible (only matters at cycle boundaries, or weird cache changes)
                 if (_currentTrack != null && map.Count > 1 &&
                     string.Equals(nextUrl, _currentTrack.PreviewUrl, StringComparison.OrdinalIgnoreCase))
                 {
-                    // Swap with a later different one if we can
                     int swapIndex = -1;
                     for (int i = st.Pos + 1; i < st.OrderUrls.Count; i++)
                     {
@@ -536,19 +453,17 @@ namespace SoundShelf.Audio
 
                 if (map.TryGetValue(nextUrl, out var track))
                     return track;
-
-                // If url not present anymore, continue loop (rare)
             }
         }
 
         private void PlayTrack(PreviewTrack track, string albumKey, PictureBox tilePb)
         {
-            // If we were mid-crossfade, stop everything cleanly
-            StopBoth();
+            _engine.Stop();
+            _crossfadeArmed = false;
 
-            // push current into history (if different)
-            if (_currentTrack != null && !string.Equals(_currentTrack.PreviewUrl, track.PreviewUrl, StringComparison.OrdinalIgnoreCase)
-                && _activeCoverPb != null && _currentAlbumKey != null)
+            if (_currentTrack != null &&
+                !string.Equals(_currentTrack.PreviewUrl, track.PreviewUrl, StringComparison.OrdinalIgnoreCase) &&
+                _activeCoverPb != null && _currentAlbumKey != null)
             {
                 _history.Push(new HistoryEntry
                 {
@@ -561,79 +476,65 @@ namespace SoundShelf.Audio
             _currentTrack = track;
             _currentAlbumKey = albumKey;
 
-            // Ensure tile is active for label + icon updates
             SetActiveTile(tilePb);
 
-            // Play on current player at base volume
-            _cur.settings.volume = _baseVolume;
-            _nxt.settings.volume = 0;
+            _engine.SetVolume(_baseVolume);
+            _engine.PlayUrl(track.PreviewUrl);
 
-            _cur.controls.stop();
-            _cur.URL = track.PreviewUrl;
-            _cur.controls.play();
-
+            _isPlaying = true;
             UpdateActiveTileLabelToSong(track);
+            UpdateAllPlayIconsSafe();
         }
 
         private void TogglePlayPause()
         {
-            bool curPlaying = _cur.playState == WMPPlayState.wmppsPlaying;
-
-            if (curPlaying)
+            if (_engine.PlaybackState == NAudio.Wave.PlaybackState.Playing)
             {
-                try { _cur.controls.pause(); } catch { }
-                if (_isCrossfading)
-                {
-                    try { _nxt.controls.pause(); } catch { }
-                }
+                _engine.Pause();
+                _isPlaying = false;
             }
             else
             {
-                try { _cur.controls.play(); } catch { }
-                if (_isCrossfading)
-                {
-                    try { _nxt.controls.play(); } catch { }
-                }
+                _engine.Resume();
+                _isPlaying = true;
 
-                // make sure label flips back to song text
                 if (_currentTrack != null)
                     UpdateActiveTileLabelToSong(_currentTrack);
             }
+
+            UpdateAllPlayIconsSafe();
         }
 
         private void Previous()
         {
-            // Restart current preview if played enough
-            try
+            if (_history.Count == 0)
             {
-                if (_currentTrack != null)
+                if (_currentTrack != null && !string.IsNullOrWhiteSpace(_currentTrack.PreviewUrl) && _activeCoverPb != null)
                 {
-                    double pos = _cur.controls.currentPosition;
-                    if (pos >= RestartThresholdSeconds)
-                    {
-                        _cur.controls.currentPosition = 0;
-                        return;
-                    }
-                }
-            }
-            catch { /* ignore */ }
+                    _engine.Stop();
+                    _crossfadeArmed = false;
 
-            // Otherwise go back in history (could be a different tile/album)
-            if (_history.Count == 0) return;
+                    _engine.SetVolume(_baseVolume);
+                    _engine.PlayUrl(_currentTrack.PreviewUrl);
+
+                    _isPlaying = true;
+                    UpdateActiveTileLabelToSong(_currentTrack);
+                    UpdateAllPlayIconsSafe();
+                }
+                return;
+            }
 
             var entry = _history.Pop();
-            if (entry.Track == null || string.IsNullOrWhiteSpace(entry.Track.PreviewUrl)) return;
+            if (string.IsNullOrWhiteSpace(entry.Track.PreviewUrl)) return;
 
-            // Ensure we stop crossfade and play cleanly
-            StopBoth();
+            _engine.Stop();
+            _crossfadeArmed = false;
 
-            // Activate that tile and play that track
             SetActiveTile(entry.TilePb);
 
             _currentTrack = entry.Track;
             _currentAlbumKey = entry.AlbumKey;
 
-            // if we have a list for this album key, set index (helps future crossfades)
             if (_activeCoverPb?.Tag is Album album)
             {
                 var key = AlbumKey(album);
@@ -644,156 +545,24 @@ namespace SoundShelf.Audio
                 }
             }
 
-            _cur.settings.volume = _baseVolume;
-            _nxt.settings.volume = 0;
+            _engine.SetVolume(_baseVolume);
+            _engine.PlayUrl(entry.Track.PreviewUrl);
 
-            _cur.controls.stop();
-            _cur.URL = entry.Track.PreviewUrl;
-            _cur.controls.play();
-
+            _isPlaying = true;
             UpdateActiveTileLabelToSong(entry.Track);
-        }
-
-        // ---------- Crossfade engine ----------
-
-        private void CrossfadePollTick()
-        {
-            if (_isCrossfading) return;
-            if (_activeCoverPb == null) return;
-            if (_activeCoverPb.Tag is not Album album) return;
-            if (_currentTrackList == null || _currentTrackList.Count == 0) return;
-            if (_cur.playState != WMPPlayState.wmppsPlaying) return;
-
-            double dur, pos;
-            try
-            {
-                dur = _cur.currentMedia?.duration ?? 0;
-                pos = _cur.controls.currentPosition;
-            }
-            catch
-            {
-                return;
-            }
-
-            if (dur <= 0) return;
-
-            double remaining = dur - pos;
-            double cf = Math.Max(0.25, CrossfadeMs / 1000.0);
-
-            // Start crossfade when within window
-            if (remaining <= cf)
-            {
-                StartCrossfadeToNext(album);
-            }
-        }
-
-        private void StartCrossfadeToNext(Album album)
-        {
-            if (_isCrossfading) return;
-            if (_currentTrackList == null || _currentTrackList.Count == 0) return;
-            if (_activeCoverPb == null) return;
-
-            _isCrossfading = true;
-
-            // Pick next sequential track (wrap)
-            int nextIndex = _currentTrackIndex < 0 ? 0 : (_currentTrackIndex + 1) % _currentTrackList.Count;
-            _currentTrackIndex = nextIndex;
-
-            var nextTrack = _currentTrackList[nextIndex];
-
-            // Start NEXT at volume 0
-            try { _nxt.controls.stop(); } catch { }
-            _nxt.URL = nextTrack.PreviewUrl;
-            _nxt.settings.volume = 0;
-            _nxt.controls.play();
-
-            // Update current-track metadata now (UI shows the incoming track)
-            _currentTrack = nextTrack;
-            _currentAlbumKey = AlbumKey(album);
-            UpdateActiveTileLabelToSong(nextTrack);
             UpdateAllPlayIconsSafe();
-
-            // Start ramp
-            int totalMs = Math.Max(200, CrossfadeMs);
-            int tickMs = 25;
-            int steps = Math.Max(1, totalMs / tickMs);
-            int i = 0;
-            int startVol = _baseVolume;
-
-            _crossfadeRamp?.Stop();
-            _crossfadeRamp?.Dispose();
-
-            _crossfadeRamp = new System.Windows.Forms.Timer { Interval = tickMs };
-            _crossfadeRamp.Tick += (s, e) =>
-            {
-                i++;
-                double t = Math.Min(1.0, (double)i / steps);
-
-                int curVol = (int)Math.Round(startVol * (1.0 - t));
-                int nxtVol = (int)Math.Round(startVol * t);
-
-                _cur.settings.volume = Math.Max(0, Math.Min(100, curVol));
-                _nxt.settings.volume = Math.Max(0, Math.Min(100, nxtVol));
-
-                if (t >= 1.0)
-                {
-                    try { _cur.controls.stop(); } catch { }
-
-                    SwapPlayers();
-
-                    // lock volumes after swap
-                    _cur.settings.volume = _baseVolume;
-                    _nxt.settings.volume = 0;
-
-                    _isCrossfading = false;
-
-                    _crossfadeRamp!.Stop();
-                    _crossfadeRamp!.Dispose();
-                    _crossfadeRamp = null;
-                }
-            };
-            _crossfadeRamp.Start();
         }
 
-        private void SwapPlayers()
+        private void PollPlaybackState()
         {
-            var tmp = _cur;
-            _cur = _nxt;
-            _nxt = tmp;
-        }
+            bool nowPlaying = _engine.PlaybackState == NAudio.Wave.PlaybackState.Playing;
+            if (nowPlaying == _isPlaying) return;
 
-        private void StopBoth()
-        {
-            try { _a.controls.stop(); } catch { }
-            try { _b.controls.stop(); } catch { }
-
-            // stop ramps
-            if (_crossfadeRamp != null)
-            {
-                try { _crossfadeRamp.Stop(); } catch { }
-                try { _crossfadeRamp.Dispose(); } catch { }
-                _crossfadeRamp = null;
-            }
-
-            _isCrossfading = false;
-
-            // reset volumes
-            _cur.settings.volume = _baseVolume;
-            _nxt.settings.volume = 0;
-        }
-
-        private void OnAnyPlayerStateChange(WMPPlayState state)
-        {
-            // compute "any playing"
-            bool anyPlaying =
-                _a.playState == WMPPlayState.wmppsPlaying ||
-                _b.playState == WMPPlayState.wmppsPlaying;
-
-            _isPlaying = anyPlaying;
+            _isPlaying = nowPlaying;
 
             RunOnUiThread(() =>
             {
-                if (anyPlaying)
+                if (_isPlaying)
                 {
                     if (_currentTrack != null)
                         UpdateActiveTileLabelToSong(_currentTrack);
@@ -802,12 +571,49 @@ namespace SoundShelf.Audio
                 {
                     RestoreActiveTileLabelToAlbum();
                 }
-
                 UpdateAllPlayIconsSafe();
             });
         }
 
-        // ---------- Icons + UI helpers ----------
+        private void CrossfadePollTick()
+        {
+            if (!_isPlaying) return;
+            if (_activeCoverPb == null) return;
+            if (_activeCoverPb.Tag is not Album album) return;
+            if (_currentTrackList == null || _currentTrackList.Count == 0) return;
+            if (_engine.PlaybackState != NAudio.Wave.PlaybackState.Playing) return;
+
+            var remaining = _engine.GetCurrentRemainingSeconds();
+            if (remaining == null) return;
+
+            double window = Math.Max(0.25, CrossfadeMs / 1000.0);
+
+            if (remaining <= window)
+            {
+                if (_crossfadeArmed) return;
+                _crossfadeArmed = true;
+
+                int nextIndex = _currentTrackIndex < 0 ? 0 : (_currentTrackIndex + 1) % _currentTrackList.Count;
+                _currentTrackIndex = nextIndex;
+
+                var next = _currentTrackList[nextIndex];
+                if (string.IsNullOrWhiteSpace(next.PreviewUrl)) return;
+
+                // Update UI to incoming track
+                _currentTrack = next;
+                _currentAlbumKey = AlbumKey(album);
+                UpdateActiveTileLabelToSong(next);
+                UpdateAllPlayIconsSafe();
+
+                _engine.CrossfadeTo(next.PreviewUrl, CrossfadeMs);
+            }
+            else
+            {
+                _crossfadeArmed = false;
+            }
+        }
+
+        // ---------------- UI helpers ----------------
 
         private enum MiniIcon { Prev, Play, Pause, Next }
 
@@ -850,13 +656,13 @@ namespace SoundShelf.Audio
             switch (which)
             {
                 case MiniIcon.Play:
+                    g.FillPolygon(brush, new[]
                     {
-                        PointF p1 = new(r.Left + 1, r.Top);
-                        PointF p2 = new(r.Right, r.Top + r.Height / 2f);
-                        PointF p3 = new(r.Left + 1, r.Bottom);
-                        g.FillPolygon(brush, new[] { p1, p2, p3 });
-                        break;
-                    }
+                        new PointF(r.Left + 1, r.Top),
+                        new PointF(r.Right, r.Top + r.Height / 2f),
+                        new PointF(r.Left + 1, r.Bottom)
+                    });
+                    break;
 
                 case MiniIcon.Pause:
                     {
@@ -872,10 +678,12 @@ namespace SoundShelf.Audio
                 case MiniIcon.Next:
                     {
                         int barW = Math.Max(3, size / 8);
-                        PointF n1 = new(r.Left, r.Top);
-                        PointF n2 = new(r.Right - barW - 1, r.Top + r.Height / 2f);
-                        PointF n3 = new(r.Left, r.Bottom);
-                        g.FillPolygon(brush, new[] { n1, n2, n3 });
+                        g.FillPolygon(brush, new[]
+                        {
+                            new PointF(r.Left, r.Top),
+                            new PointF(r.Right - barW - 1, r.Top + r.Height / 2f),
+                            new PointF(r.Left, r.Bottom)
+                        });
                         g.FillRectangle(brush, r.Right - barW, r.Top, barW, r.Height);
                         break;
                     }
@@ -884,11 +692,12 @@ namespace SoundShelf.Audio
                     {
                         int barW2 = Math.Max(3, size / 8);
                         g.FillRectangle(brush, r.Left, r.Top, barW2, r.Height);
-
-                        PointF v1 = new(r.Right, r.Top);
-                        PointF v2 = new(r.Left + Math.Max(6, size / 3), r.Top + r.Height / 2f);
-                        PointF v3 = new(r.Right, r.Bottom);
-                        g.FillPolygon(brush, new[] { v1, v2, v3 });
+                        g.FillPolygon(brush, new[]
+                        {
+                            new PointF(r.Right, r.Top),
+                            new PointF(r.Left + Math.Max(6, size / 3), r.Top + r.Height / 2f),
+                            new PointF(r.Right, r.Bottom)
+                        });
                         break;
                     }
             }
@@ -905,10 +714,7 @@ namespace SoundShelf.Audio
 
         private static int GuessBottomLabelHeight(Control cellContainer)
         {
-            var bottom = cellContainer.Controls
-                .OfType<Control>()
-                .FirstOrDefault(c => c.Dock == DockStyle.Bottom);
-
+            var bottom = cellContainer.Controls.OfType<Control>().FirstOrDefault(c => c.Dock == DockStyle.Bottom);
             return bottom?.Height > 0 ? bottom.Height : 30;
         }
 
